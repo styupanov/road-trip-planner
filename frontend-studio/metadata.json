@@ -1,0 +1,6 @@
+{
+  "name": "Verified Road Trip Planner",
+  "description": "A dense, flat-styled interactive road trip planner featuring a dual-pane dashboard layout, preference quiz, routing refinements, and route visualization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
