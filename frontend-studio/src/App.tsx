@@ -1417,6 +1417,19 @@ export default function App() {
       });
   };
 
+  // routeThroughByOption MUST be a dependency here, not just includedByOption:
+  // toggling a stop changes includedByOption synchronously (scheduling this
+  // effect's setTimeout with a saveDraftNow closure over routeThroughByOption
+  // AS IT WAS AT THAT RENDER — still the pre-recompute value, since
+  // /route-through is an in-flight async call at that point). Without this
+  // dependency, when recomputeRouteThrough's response later lands and updates
+  // routeThroughByOption, nothing reschedules the pending save — the stale
+  // closure fires anyway 1.5s after the TOGGLE, not after the recompute,
+  // persisting yesterday's delta_s into draft_state (confirmed: restoring a
+  // draft showed the delta from BEFORE the last checkbox change, not after).
+  // Including it here means a routeThroughByOption update restarts the
+  // debounce with a fresh closure, and self-heals even if the recompute
+  // takes longer than 1.5s (a second effect run reschedules once it lands).
   useEffect(() => {
     if (phase !== 'plan' || options.length === 0) return;
 
@@ -1427,7 +1440,7 @@ export default function App() {
     return () => {
       if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
     };
-  }, [phase, options, activeOptionIndex, includedByOption, tripTitle]);
+  }, [phase, options, activeOptionIndex, includedByOption, routeThroughByOption, tripTitle]);
 
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#22262b]">
