@@ -2,7 +2,11 @@ import React from 'react';
 import { TripMap, PlanMapMarker } from './TripMap';
 
 interface MapComponentProps {
-  phase: 'quiz' | 'refine' | 'generating' | 'plan';
+  // 'finalizing' renders exactly like 'plan' (see App.tsx's call site, which
+  // passes the pre-finalize plan overlay through unchanged so the map stays
+  // put while the progress screen runs alongside it). 'finalized' gets its
+  // own overlay data, derived from the snapshot instead of the live draft.
+  phase: 'quiz' | 'refine' | 'generating' | 'plan' | 'finalizing' | 'finalized';
   generationStep: number;
   routeLine: Array<{ lat: number; lng: number }>;
   originCoord: { lat: number; lng: number } | null;
@@ -43,8 +47,10 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   onToggleStop
 }) => {
   // 'generating' shows a live single-line preview while the plan overlay isn't
-  // ready yet; 'plan' switches entirely to the multi-option overlay below.
+  // ready yet; 'plan'/'finalizing' (same overlay, see prop comment above) and
+  // 'finalized' switch entirely to the multi-option/snapshot overlay below.
   const drawPath = phase === 'generating' && generationStep >= 0;
+  const showOverlay = phase === 'plan' || phase === 'finalizing' || phase === 'finalized';
 
   return (
     <div className="relative w-full h-full">
@@ -57,14 +63,15 @@ export const MapComponent: React.FC<MapComponentProps> = ({
         onDestDragEnd={onDestDragEnd}
         pickingField={pickingField}
         onMapClick={onMapClick}
-        planRouteLines={phase === 'plan' ? planRouteLines : []}
-        planMarkers={phase === 'plan' ? planMarkers : []}
-        activeDaySegments={phase === 'plan' ? activeDaySegments : []}
-        dayBoundaryMarkers={phase === 'plan' ? dayBoundaryMarkers : []}
+        planRouteLines={showOverlay ? planRouteLines : []}
+        planMarkers={showOverlay ? planMarkers : []}
+        activeDaySegments={showOverlay ? activeDaySegments : []}
+        dayBoundaryMarkers={showOverlay ? dayBoundaryMarkers : []}
         selectedStopId={selectedStopId}
         onSelectStop={onSelectStop}
         onClosePopup={onClosePopup}
         onToggleStop={onToggleStop}
+        readOnly={phase === 'finalized' || phase === 'finalizing'}
       />
     </div>
   );

@@ -406,3 +406,65 @@ async def get_job_status(user_id: uuid.UUID, job_id: uuid.UUID) -> JobStatus | N
             job_id, user_id,
         )
     return JobStatus(status=row["status"], trip_version_id=row["trip_version_id"], error=row["error"]) if row else None
+
+
+async def get_balance(user_id: uuid.UUID) -> int:
+    """Plain unlocked read, for display only — never used to decide whether a
+    charge can proceed (start_finalization does its own FOR UPDATE read for
+    that, unchanged from подшаг 1). 0 if the row doesn't exist rather than
+    raising — shouldn't happen post-signup (claim_session_for_google_user
+    always creates one), but a missing account reads the same as an empty one
+    here, not an error."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        balance = await conn.fetchval(
+            "SELECT balance FROM app.credit_accounts WHERE user_id = $1", user_id
+        )
+    return balance if balance is not None else 0
+
+
+async def is_first_finalize(user_id: uuid.UUID) -> bool:
+    """True if this user has exactly one finalized trip_version total, right
+    now — gates the one-time "this one's on us" welcome modal (подшаг 3),
+    shown once right after a user's first successful Finalize.
+
+    Counts trip_versions, not credit_ledger's 'finalize:%' entries: a ledger
+    charge happens on every attempt, including ones that later fail and get
+    refunded, so it would overcount. A trip_versions row only ever exists for
+    a run that actually completed — the right signal for "has this user ever
+    seen a finished result before."
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            """
+            SELECT count(*) FROM app.trip_versions tv
+            JOIN app.trip_projects tp ON tp.id = tv.trip_project_id
+            WHERE tp.owner_user_id = $1 AND tv.version_type = 'finalized'
+            """,
+            user_id,
+        )
+    return count == 1
+
+
+async def get_finalized_snapshot(
+    session_id: uuid.UUID, user_id: uuid.UUID | None, trip_id: uuid.UUID
+) -> dict | None:
+    """None if the trip doesn't exist, doesn't belong to the caller (same
+    session/owner check as trips.get_trip_for_session), or has never been
+    finalized (finalized_version_id IS NULL) — same indistinguishable-404
+    reasoning used everywhere else in this app: never confirm to the caller
+    which of those three it was.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT tv.snapshot
+            FROM app.trip_projects tp
+            JOIN app.trip_versions tv ON tv.id = tp.finalized_version_id
+            WHERE tp.id = $1 AND (tp.anonymous_session_id = $2 OR tp.owner_user_id = $3)
+            """,
+            trip_id, session_id, user_id,
+        )
+    return json.loads(row["snapshot"]) if row else None

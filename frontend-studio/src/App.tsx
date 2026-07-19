@@ -9,14 +9,20 @@ import { MyTripsModal } from './components/MyTripsModal';
 import {
   getCompareRoutes, postRouteThrough, postDetailRoute, postEnrichRoute, getWhoAmI,
   saveTrip, getCurrentTrip, getMyTrips, getTrip, deleteTrip, loginWithGoogle, getMe, logout,
+  getCredits, postFinalizeTrip, getFinalizeStatus, getFinalizedTrip,
   decodeShape, decodeGoogleShape, geocode, reverseGeocode,
   ApiStop, RouteOption, DetailRouteResult, EnrichRouteResult, TripProject, TripSummary,
+  CreditsResult, FinalizedTripResult,
 } from './api';
 import { mapDetourToMaxDetourS, mapDriveToDailyLimitS, mapInterestsToCategories, mapPaceToApiPace } from './quizMapping';
 import { dayColor } from './dayColors';
 import { splitPathIntoLegs } from './routeSegments';
 import { PlanPanel, RouteThroughSummary } from './components/PlanPanel';
 import { DateModal } from './components/DateModal';
+import { FinalizeGateModal } from './components/FinalizeGateModal';
+import { FinalizeProgress } from './components/FinalizeProgress';
+import { FinalizedView } from './components/FinalizedView';
+import { WelcomeModal } from './components/WelcomeModal';
 
 // Default/fallback coordinates, used for route building if geocoding never resolves.
 // Must stay within Colorado — Valhalla's tiles only cover this state.
@@ -53,8 +59,10 @@ interface DraftStateSnapshot {
 }
 
 export default function App() {
-  // Application Phase
-  const [phase, setPhase] = useState<'quiz' | 'refine' | 'generating' | 'plan'>('quiz');
+  // Application Phase. 'finalizing'/'finalized' (Фаза 3, подшаг 3) are only
+  // ever entered from 'plan' (Finalize confirm -> job -> result) or directly
+  // from "Мои поездки" ('finalized' only, opening an already-finalized trip).
+  const [phase, setPhase] = useState<'quiz' | 'refine' | 'generating' | 'plan' | 'finalizing' | 'finalized'>('quiz');
 
   // Quiz State
   const [step, setStep] = useState<number>(0);
@@ -149,6 +157,28 @@ export default function App() {
   // touches the draft; it's a plain overlay over whatever screen was showing.
   const [showFinalizeModal, setShowFinalizeModal] = useState<boolean>(false);
   const [authModalError, setAuthModalError] = useState<string | null>(null);
+  // Set right before opening the sign-in modal from Finalize specifically
+  // (not from the header's plain "Войти") — handleGoogleCredential checks
+  // this after a successful login to resume straight into the balance
+  // check/confirm screen, instead of just closing the modal.
+  const [pendingAuthAction, setPendingAuthAction] = useState<'finalize' | null>(null);
+
+  // Фаза 3, подшаг 3: Finalize flow state. null/'paywall'/'confirm' drives
+  // FinalizeGateModal; the idempotency key is generated once per visit to
+  // the confirm screen (openFinalizeGate), never per click/retry — a failed
+  // POST can be safely retried with the SAME key (see postFinalizeTrip).
+  const [finalizeGateStage, setFinalizeGateStage] = useState<'paywall' | 'confirm' | null>(null);
+  const [finalizeIdempotencyKey, setFinalizeIdempotencyKey] = useState<string | null>(null);
+  const [finalizeSubmitting, setFinalizeSubmitting] = useState<boolean>(false);
+  const [finalizeGateError, setFinalizeGateError] = useState<string | null>(null);
+  const [finalizeJobId, setFinalizeJobId] = useState<string | null>(null);
+  const finalizePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The immutable result of a completed Finalize — populated either by the
+  // just-finished job (loadFinalizedResult) or by opening an already-
+  // finalized trip from "Мои поездки" (handleOpenFinalizedFromList).
+  const [finalizedTrip, setFinalizedTrip] = useState<FinalizedTripResult | null>(null);
+  const [credits, setCredits] = useState<CreditsResult | null>(null);
+  const [showWelcomeModal, setShowWelcomeModal] = useState<boolean>(false);
 
   // Auth state (Фаза 2) — who the CURRENT session is linked to, if anyone.
   // Fetched once on mount via getMe(); updated in place by
@@ -583,17 +613,22 @@ export default function App() {
     // Nothing worth persisting exists yet at 'refine'.
   };
 
-  // Finalize itself (spending a credit) isn't wired up yet — this just opens
-  // the same sign-in modal the header's "Войти" uses. Once auth exists in the
-  // UI, clicking Finalize while already authenticated would move on to an
-  // actual charge; that branch doesn't exist yet, only the sign-in gate does.
+  // Step 1 of Finalize: not authenticated -> sign-in modal, remembering to
+  // resume straight into the balance check once login succeeds. Already
+  // authenticated -> skip straight to that check.
   const handleFinalizeClick = () => {
     setAuthModalError(null);
-    setShowFinalizeModal(true);
+    if (!authState.authenticated) {
+      setPendingAuthAction('finalize');
+      setShowFinalizeModal(true);
+      return;
+    }
+    openFinalizeGate();
   };
 
   const handleLoginClick = () => {
     setAuthModalError(null);
+    setPendingAuthAction(null);
     setShowFinalizeModal(true);
   };
 
@@ -610,6 +645,10 @@ export default function App() {
         setAuthState({ authenticated: true, email: result.email });
         setShowFinalizeModal(false);
         setAuthModalError(null);
+        if (pendingAuthAction === 'finalize') {
+          setPendingAuthAction(null);
+          openFinalizeGate();
+        }
       })
       .catch(err => {
         console.error('Google sign-in failed:', err);
@@ -629,21 +668,27 @@ export default function App() {
   const handleMyTripsClick = () => {
     if (!authState.authenticated) {
       setAuthModalError(null);
+      setPendingAuthAction(null);
       setShowFinalizeModal(true);
       return;
     }
     setShowMyTripsModal(true);
   };
 
-  // Opening a trip from the list uses the exact same restore path as the
-  // "Продолжить поездку" banner (handleRestoreDraft) — same draft_state
-  // shape, same exact-restore guarantee, just reached from a different list.
-  const handleOpenTripFromList = (id: string) => {
+  // "Мои поездки" opens a draft the same way the "Продолжить поездку" banner
+  // does (handleRestoreDraft — same draft_state shape, same exact-restore
+  // guarantee). A finalized trip opens the read-only view instead (Фаза 3,
+  // подшаг 3) — same trip_project, different data source (trip_versions
+  // snapshot, not draft_state), so it's a genuinely different code path, not
+  // a variant of the same one.
+  const handleOpenTripFromList = (id: string, status: string) => {
+    setShowMyTripsModal(false);
+    if (status === 'finalized') {
+      handleOpenFinalizedFromList(id);
+      return;
+    }
     getTrip(id)
-      .then(trip => {
-        setShowMyTripsModal(false);
-        handleRestoreDraft(trip);
-      })
+      .then(trip => handleRestoreDraft(trip))
       .catch(err => console.error('Failed to open trip:', err));
   };
 
@@ -651,6 +696,161 @@ export default function App() {
     deleteTrip(id)
       .then(() => setMyTrips(prev => prev.filter(t => t.id !== id)))
       .catch(err => console.error('Failed to delete trip:', err));
+  };
+
+  // Step 2: balance check. balance>=1 -> straight to the confirm screen (with
+  // a fresh idempotency key for this attempt); balance=0 -> paywall dead end.
+  const openFinalizeGate = () => {
+    setFinalizeGateError(null);
+    getCredits()
+      .then(result => {
+        setCredits(result);
+        if (result.balance >= 1) {
+          setFinalizeIdempotencyKey(crypto.randomUUID());
+          setFinalizeGateStage('confirm');
+        } else {
+          setFinalizeGateStage('paywall');
+        }
+      })
+      .catch(err => {
+        console.error('Failed to fetch credits:', err);
+        setFinalizeGateError('Не удалось проверить баланс. Попробуйте ещё раз.');
+      });
+  };
+
+  const handleCloseFinalizeGate = () => {
+    if (finalizeSubmitting) return; // ignore stray closes mid-request
+    setFinalizeGateStage(null);
+    setFinalizeGateError(null);
+  };
+
+  // Step 4: spend the credit. Saves the draft first (bypassing the 1.5s
+  // autosave debounce — Finalize reads trip_project.draft_state straight
+  // from the DB, see finalize.py, so a toggle from a second ago must already
+  // be there) and reuses the SAME idempotency key across retries within this
+  // one confirm-screen visit (see finalizeIdempotencyKey's own comment).
+  const handleConfirmFinalize = () => {
+    if (finalizeSubmitting || !finalizeIdempotencyKey || !tripProjectId) return;
+    setFinalizeSubmitting(true);
+    setFinalizeGateError(null);
+
+    const idKey = finalizeIdempotencyKey;
+    const tripId = tripProjectId;
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+
+    saveDraftNow()
+      // saveDraftNow never rejects (see its own comment) — even a failed save
+      // still leaves the last successfully-saved draft_state for Finalize to
+      // read, so proceeding here regardless is intentional, not a swallowed bug.
+      .then(() => postFinalizeTrip(tripId, idKey))
+      .then(result => {
+        setFinalizeSubmitting(false);
+        setFinalizeGateStage(null);
+        setSelectedStopId(null);
+        setFinalizeJobId(result.job_id);
+        setPhase('finalizing');
+        startFinalizePolling(result.job_id, tripId);
+      })
+      .catch(err => {
+        console.error('Failed to start finalize:', err);
+        setFinalizeSubmitting(false);
+        setFinalizeGateError((err as Error).message || 'Не удалось запустить финализацию. Попробуйте ещё раз.');
+      });
+  };
+
+  const stopFinalizePolling = () => {
+    if (finalizePollRef.current) {
+      clearInterval(finalizePollRef.current);
+      finalizePollRef.current = null;
+    }
+  };
+
+  // Step 5: poll every ~2s. pending/processing just keep polling — the
+  // animated stage labels in FinalizeProgress are cosmetic, this status is
+  // the only real signal (see finalize.py: 14-19s total for Google+Gemini).
+  const startFinalizePolling = (jobId: string, tripId: string) => {
+    stopFinalizePolling();
+    finalizePollRef.current = setInterval(() => {
+      getFinalizeStatus(jobId)
+        .then(status => {
+          if (status.status === 'done') {
+            stopFinalizePolling();
+            loadFinalizedResult(tripId);
+          } else if (status.status === 'failed') {
+            stopFinalizePolling();
+            handleFinalizeJobFailed(status.error);
+          }
+        })
+        .catch(err => console.error('Failed to poll finalize status:', err));
+    }, 2000);
+  };
+
+  // Step 6 (success): load the self-contained snapshot and show it.
+  // is_first_finalize comes straight off this response (see finalize.py) —
+  // no separate round trip needed just to decide the welcome modal.
+  const loadFinalizedResult = (tripId: string) => {
+    getFinalizedTrip(tripId)
+      .then(result => {
+        setFinalizedTrip(result);
+        setOriginCoord({ lat: result.origin.lat, lng: result.origin.lon });
+        setDestCoord({ lat: result.destination.lat, lng: result.destination.lon });
+        setFinalizeJobId(null);
+        setPhase('finalized');
+        if (result.is_first_finalize) {
+          setShowWelcomeModal(true);
+        }
+        // Balance just changed (charged) — best-effort refresh for anywhere
+        // it's displayed; failure here doesn't affect the result shown above.
+        getCredits().then(setCredits).catch(() => {});
+      })
+      .catch(err => {
+        console.error('Failed to load finalized trip:', err);
+        setFinalizeGateError('Поездка финализирована, но результат не загрузился. Загляните в «Мои поездки».');
+        setPhase('plan');
+      });
+  };
+
+  // Step 6 (failure): the backend has already refunded by the time 'failed'
+  // is observable here (process_finalization's refund happens before the job
+  // row is updated) — this just reflects that back, softly, and returns to
+  // the draft, which was never touched.
+  const handleFinalizeJobFailed = (error: string | null) => {
+    setFinalizeJobId(null);
+    setPhase('plan');
+    getCredits().then(setCredits).catch(() => {});
+    setMessages(prev => [...prev, {
+      id: `finalize-failed-${Date.now()}`,
+      sender: 'bot',
+      text: 'Не удалось финализировать поездку — кредит возвращён. Можно попробовать ещё раз.',
+    }]);
+    console.error('Finalize job failed:', error);
+  };
+
+  // "Мои поездки" -> a finalized card's "Смотреть финал".
+  const handleOpenFinalizedFromList = (id: string) => {
+    getFinalizedTrip(id)
+      .then(result => {
+        setTripProjectId(id);
+        setFinalizedTrip(result);
+        setOriginCoord({ lat: result.origin.lat, lng: result.origin.lon });
+        setDestCoord({ lat: result.destination.lat, lng: result.destination.lon });
+        setSelectedStopId(null);
+        setPhase('finalized');
+      })
+      .catch(err => console.error('Failed to open finalized trip:', err));
+  };
+
+  // FinalizedView's "Редактировать черновик" — the SAME trip_project's
+  // draft_state, independent of (and untouched by) the finalized snapshot
+  // just shown; edits here never alter the finalized version already saved.
+  const handleEditDraftFromFinalized = () => {
+    if (!tripProjectId) return;
+    getTrip(tripProjectId)
+      .then(trip => handleRestoreDraft(trip))
+      .catch(err => console.error('Failed to open draft:', err));
   };
 
   // Enters the 'plan' phase with the fetched route options: seeds per-option
@@ -1033,78 +1233,133 @@ export default function App() {
   const originVal = answers.origin ? (Array.isArray(answers.origin) ? answers.origin[0] : answers.origin) : '';
   const destVal = answers.dest ? (Array.isArray(answers.dest) ? answers.dest[0] : answers.dest) : '';
 
-  // Map overlay for the 'plan' phase: every option's base line, active one swapped
-  // for its through-route (the route actually taken with its included stops) so the
-  // highlighted line reflects the current checkbox state, not just the raw option.
-  // If that active option has been detailed via Google, its EXACT polyline wins over
-  // the Valhalla through-route — but it's precision 5, decoded with a different
-  // function (decodeGoogleShape), never decodeShape (precision 6, Valhalla-only).
-  const planRouteLinesForMap = options.map((option, idx) => {
-    const isActive = idx === activeOptionIndex;
-    if (!isActive) {
-      return { points: decodeShape(option.route_shape), isActive: false };
-    }
-    const detail = detailedByOption.get(idx);
-    if (detail) {
-      return { points: decodeGoogleShape(detail.shape), isActive: true };
-    }
-    const shape = routeThroughByOption.get(idx)?.through_shape ?? option.route_shape;
-    return { points: decodeShape(shape), isActive: true };
-  });
-
-  const activeOption = options[activeOptionIndex];
-  const activeIncludedForMap = includedByOption.get(activeOptionIndex) ?? new Set<number>();
-  const includedSortedForMap = (activeOption?.stops ?? [])
-    .filter(s => activeIncludedForMap.has(s.id))
-    .sort((a, b) => a.to_poi_s - b.to_poi_s);
-  const orderByIdForMap = new Map(includedSortedForMap.map((s, i) => [s.id, i + 1]));
-  const planMarkersForMap = (activeOption?.stops ?? []).map(stop => ({
-    stop,
-    included: activeIncludedForMap.has(stop.id),
-    order: orderByIdForMap.get(stop.id) ?? null,
-  }));
-
-  // Day-colored route segments + boundary markers for the active option — only
-  // exist once /detail-route has run (day_split needs Google's per-leg times,
-  // see day_split.py). `includedSortedForMap` is the exact same stop order
-  // sent to /detail-route (same included set, same to_poi_s sort), so
-  // detail.days[i].stop_indices index straight into it.
-  const activeDetailForMap = detailedByOption.get(activeOptionIndex);
+  // Map overlay. Two independent sources depending on phase:
+  // - 'finalized': the immutable snapshot (finalizedTrip) — one route, no
+  //   alternatives, day segments/markers straight from snapshot.days.
+  // - everything else ('plan'/'finalizing', which keeps showing the plan
+  //   overlay underneath the progress screen — see MapComponent's phase
+  //   comment): every option's base line, active one swapped for its
+  //   through-route (the route actually taken with its included stops) so
+  //   the highlighted line reflects the current checkbox state, not just the
+  //   raw option. If that active option has been detailed via Google, its
+  //   EXACT polyline wins over the Valhalla through-route — but it's
+  //   precision 5, decoded with a different function (decodeGoogleShape),
+  //   never decodeShape (precision 6, Valhalla-only).
+  let planRouteLinesForMap: Array<{ points: { lat: number; lng: number }[]; isActive: boolean }>;
+  let planMarkersForMap: Array<{ stop: ApiStop; included: boolean; order: number | null }>;
   let activeDaySegments: Array<{ points: { lat: number; lng: number }[]; color: string }> = [];
   let dayBoundaryMarkersForMap: Array<{ position: { lat: number; lng: number }; color: string; label: string }> = [];
 
-  if (activeDetailForMap && routeOrigin && routeDest) {
-    const waypoints = [
-      routeOrigin,
-      ...includedSortedForMap.map(s => ({ lat: s.lat, lng: s.lon })),
-      routeDest,
-    ];
-    const path = decodeGoogleShape(activeDetailForMap.shape);
-    const legSegments = splitPathIntoLegs(path, waypoints);
+  if (phase === 'finalized' && finalizedTrip) {
+    const finOrigin = { lat: finalizedTrip.origin.lat, lng: finalizedTrip.origin.lon };
+    const finDest = { lat: finalizedTrip.destination.lat, lng: finalizedTrip.destination.lon };
+    const path = decodeGoogleShape(finalizedTrip.route.shape);
+    planRouteLinesForMap = [{ points: path, isActive: true }];
 
+    const orderByIdFinal = new Map(finalizedTrip.stops.map((s, i) => [s.id, i + 1]));
+    // Padded to ApiStop's shape — about/website/duration were folded into
+    // `why`/`tips` by enrichment and aren't in the snapshot; to_poi_s/
+    // from_poi_s/suggested aren't used once a trip is finalized (no more
+    // re-sorting or re-suggesting), only present so this satisfies the type
+    // the map/popup already knows how to render.
+    planMarkersForMap = finalizedTrip.stops.map(s => ({
+      stop: {
+        id: s.id, name: s.name, category: s.category, rating: s.rating, review_count: s.review_count,
+        about: null, website: null, duration: null, lat: s.lat, lon: s.lon, detour_s: s.detour_s,
+        to_poi_s: 0, from_poi_s: 0, suggested: false,
+      },
+      included: true,
+      order: orderByIdFinal.get(s.id) ?? null,
+    }));
+
+    const waypoints = [finOrigin, ...finalizedTrip.stops.map(s => ({ lat: s.lat, lng: s.lon })), finDest];
+    const legSegments = splitPathIntoLegs(path, waypoints);
     const stopIndexToDay = new Map<number, number>();
-    activeDetailForMap.days.forEach((day, dayIdx) => {
+    finalizedTrip.days.forEach((day, dayIdx) => {
       day.stop_indices.forEach(si => stopIndexToDay.set(si, dayIdx));
     });
-    const lastDayIdx = activeDetailForMap.days.length - 1;
+    const lastDayIdx = finalizedTrip.days.length - 1;
 
     activeDaySegments = legSegments.map((points, legIdx) => {
-      // A leg ending at a stop (legIdx < stop count) belongs to that stop's
-      // day; the final leg (into dest, no stop) always belongs to the last
-      // day — same "closes wherever it lands" rule as day_split.py itself.
-      const dayIdx = legIdx < includedSortedForMap.length
+      const dayIdx = legIdx < finalizedTrip.stops.length
         ? stopIndexToDay.get(legIdx) ?? lastDayIdx
         : lastDayIdx;
       return { points, color: dayColor(dayIdx) };
     });
 
-    dayBoundaryMarkersForMap = activeDetailForMap.days.slice(1).map((day) => {
+    dayBoundaryMarkersForMap = finalizedTrip.days.slice(1).map((day) => {
       const dayIdx = day.day - 1;
-      const firstStop = includedSortedForMap[day.stop_indices[0]];
+      const firstStop = finalizedTrip.stops[day.stop_indices[0]];
       return firstStop
         ? { position: { lat: firstStop.lat, lng: firstStop.lon }, color: dayColor(dayIdx), label: `Д${day.day}` }
         : null;
     }).filter((m): m is { position: { lat: number; lng: number }; color: string; label: string } => m != null);
+  } else {
+    planRouteLinesForMap = options.map((option, idx) => {
+      const isActive = idx === activeOptionIndex;
+      if (!isActive) {
+        return { points: decodeShape(option.route_shape), isActive: false };
+      }
+      const detail = detailedByOption.get(idx);
+      if (detail) {
+        return { points: decodeGoogleShape(detail.shape), isActive: true };
+      }
+      const shape = routeThroughByOption.get(idx)?.through_shape ?? option.route_shape;
+      return { points: decodeShape(shape), isActive: true };
+    });
+
+    const activeOption = options[activeOptionIndex];
+    const activeIncludedForMap = includedByOption.get(activeOptionIndex) ?? new Set<number>();
+    const includedSortedForMap = (activeOption?.stops ?? [])
+      .filter(s => activeIncludedForMap.has(s.id))
+      .sort((a, b) => a.to_poi_s - b.to_poi_s);
+    const orderByIdForMap = new Map(includedSortedForMap.map((s, i) => [s.id, i + 1]));
+    planMarkersForMap = (activeOption?.stops ?? []).map(stop => ({
+      stop,
+      included: activeIncludedForMap.has(stop.id),
+      order: orderByIdForMap.get(stop.id) ?? null,
+    }));
+
+    // Day-colored route segments + boundary markers for the active option —
+    // only exist once /detail-route has run (day_split needs Google's
+    // per-leg times, see day_split.py). `includedSortedForMap` is the exact
+    // same stop order sent to /detail-route (same included set, same
+    // to_poi_s sort), so detail.days[i].stop_indices index straight into it.
+    const activeDetailForMap = detailedByOption.get(activeOptionIndex);
+
+    if (activeDetailForMap && routeOrigin && routeDest) {
+      const waypoints = [
+        routeOrigin,
+        ...includedSortedForMap.map(s => ({ lat: s.lat, lng: s.lon })),
+        routeDest,
+      ];
+      const path = decodeGoogleShape(activeDetailForMap.shape);
+      const legSegments = splitPathIntoLegs(path, waypoints);
+
+      const stopIndexToDay = new Map<number, number>();
+      activeDetailForMap.days.forEach((day, dayIdx) => {
+        day.stop_indices.forEach(si => stopIndexToDay.set(si, dayIdx));
+      });
+      const lastDayIdx = activeDetailForMap.days.length - 1;
+
+      activeDaySegments = legSegments.map((points, legIdx) => {
+        // A leg ending at a stop (legIdx < stop count) belongs to that stop's
+        // day; the final leg (into dest, no stop) always belongs to the last
+        // day — same "closes wherever it lands" rule as day_split.py itself.
+        const dayIdx = legIdx < includedSortedForMap.length
+          ? stopIndexToDay.get(legIdx) ?? lastDayIdx
+          : lastDayIdx;
+        return { points, color: dayColor(dayIdx) };
+      });
+
+      dayBoundaryMarkersForMap = activeDetailForMap.days.slice(1).map((day) => {
+        const dayIdx = day.day - 1;
+        const firstStop = includedSortedForMap[day.stop_indices[0]];
+        return firstStop
+          ? { position: { lat: firstStop.lat, lng: firstStop.lon }, color: dayColor(dayIdx), label: `Д${day.day}` }
+          : null;
+      }).filter((m): m is { position: { lat: number; lng: number }; color: string; label: string } => m != null);
+    }
   }
 
   // Server autosave (Фаза 1, шаг 3). Debounced trigger list, exactly:
@@ -1137,9 +1392,18 @@ export default function App() {
     };
   };
 
+  // Returns the in-flight promise (not just fire-and-forget) so
+  // handleConfirmFinalize can wait on a fresh save before POSTing finalize.
+  // Deliberately swallows its own error here (not re-thrown) — the debounced
+  // autosave effect below calls this directly as a setTimeout callback with
+  // no .catch of its own, and an unswallowed rejection there would surface
+  // as an unhandled-promise-rejection console warning on every failed
+  // autosave. Existing effect-triggered callers simply don't use the return
+  // value; handleConfirmFinalize only needs the resolution as a "give it a
+  // moment" signal, not a success/failure result.
   const saveDraftNow = () => {
     setSaveState('saving');
-    saveTrip({
+    return saveTrip({
       trip_project_id: tripProjectId,
       ...buildDraftPayload(),
     })
@@ -1190,7 +1454,11 @@ export default function App() {
               {/* Dynamic Trip Summary Bar — trip title already lives in the header above
                   (TripHeader), so this block doesn't repeat it, only the parameters
                   that appear nowhere else in the UI. */}
-              <div className={`summary ${['quiz', 'generating'].includes(phase) ? 'hidden' : ''}`} id="summary">
+              {/* Hidden for finalizing/finalized too — these can be reached directly
+                  from "Мои поездки" (handleOpenFinalizedFromList) without ever
+                  populating `answers` for that specific trip, so this bar would
+                  otherwise show stale quiz params from whatever was open before. */}
+              <div className={`summary ${['quiz', 'generating', 'finalizing', 'finalized'].includes(phase) ? 'hidden' : ''}`} id="summary">
                 <div className="w-full text-[9px] uppercase tracking-wide text-[#5a5f66] font-mono mb-0.5">
                   Параметры поездки
                 </div>
@@ -1381,8 +1649,12 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Chat message threads (Refine, Generating, Plan) */}
-                {phase !== 'quiz' && messages.map((msg) => (
+                {/* Chat message threads (Refine, Generating, Plan) — not shown for
+                    finalizing/finalized, which have their own dedicated content
+                    below instead of a message log (and, reached directly from
+                    "Мои поездки", `messages` may hold stale text from a
+                    different trip anyway). */}
+                {phase !== 'quiz' && !['finalizing', 'finalized'].includes(phase) && messages.map((msg) => (
                   <div
                     key={msg.id}
                     className={`msg ${msg.sender}`}
@@ -1408,6 +1680,23 @@ export default function App() {
                 {/* Phase: GENERATING Progress bar and stepper */}
                 {phase === 'generating' && (
                   <GenerationProgress currentStep={generationStep} />
+                )}
+
+                {/* Phase: FINALIZING — real progress, not a bare spinner (Фаза 3,
+                    подшаг 3). The map alongside keeps showing the plan overlay
+                    (see MapComponent's phase handling) so nothing goes blank. */}
+                {phase === 'finalizing' && <FinalizeProgress />}
+
+                {/* Phase: FINALIZED — the left panel just orients the user;
+                    the actual result (times, days, stop cards, sources) is
+                    FinalizedView on the right. */}
+                {phase === 'finalized' && (
+                  <div className="px-1 py-2">
+                    <p className="text-[13px] text-[#c9cfd6] leading-relaxed">
+                      Поездка финализирована: точное время маршрута, разбивка по дням и AI-гид —
+                      в панели справа. Эта версия больше не меняется; черновик остаётся доступен отдельно.
+                    </p>
+                  </div>
                 )}
 
               </div>
@@ -1482,6 +1771,15 @@ export default function App() {
               onFinalizeClick={handleFinalizeClick}
             />
           )}
+
+          {phase === 'finalized' && finalizedTrip && (
+            <FinalizedView
+              trip={finalizedTrip}
+              selectedStopId={selectedStopId}
+              onSelectStop={handleSelectStop}
+              onEditDraft={handleEditDraftFromFinalized}
+            />
+          )}
         </main>
 
         {/* Confirm New Trip Modal */}
@@ -1530,7 +1828,13 @@ export default function App() {
             {authModalError && (
               <p className="text-[11px] text-[#c05640] text-center mt-2">{authModalError}</p>
             )}
-            <button className="auth-btn alt mt-2" onClick={() => setShowFinalizeModal(false)}>
+            <button
+              className="auth-btn alt mt-2"
+              onClick={() => {
+                setShowFinalizeModal(false);
+                setPendingAuthAction(null);
+              }}
+            >
               Закрыть
             </button>
           </div>
@@ -1543,6 +1847,30 @@ export default function App() {
           onClose={() => setShowMyTripsModal(false)}
           onOpenTrip={handleOpenTripFromList}
           onDeleteTrip={handleDeleteTripFromList}
+        />
+
+        {/* Steps 2-3 of Finalize: paywall (balance=0) or the summary+confirm
+            screen (balance>=1) — see openFinalizeGate/handleConfirmFinalize. */}
+        <FinalizeGateModal
+          isOpen={finalizeGateStage !== null}
+          stage={finalizeGateStage}
+          originName={String(originVal || 'Денвер')}
+          destName={String(destVal || 'Дуранго')}
+          stopCount={(includedByOption.get(activeOptionIndex) ?? new Set<number>()).size}
+          plannedDays={typeof answers.days === 'number' ? answers.days : null}
+          flexibleDays={!!answers.flexible_days}
+          submitting={finalizeSubmitting}
+          error={finalizeGateError}
+          onConfirm={handleConfirmFinalize}
+          onClose={handleCloseFinalizeGate}
+        />
+
+        {/* Step 9: shown once, right after this user's first-ever finalized
+            result — is_first_finalize comes off the finalize response itself
+            (see loadFinalizedResult), price is never mentioned earlier than this. */}
+        <WelcomeModal
+          isOpen={showWelcomeModal}
+          onClose={() => setShowWelcomeModal(false)}
         />
 
       </div>

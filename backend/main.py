@@ -336,6 +336,23 @@ async def finalize_status(job_id: uuid.UUID, session: sessions.Session = Depends
     return FinalizeResponse(job_id=job_id, status=job.status, trip_version_id=job.trip_version_id, error=job.error)
 
 
+class CreditsResponse(BaseModel):
+    balance: int
+    # True exactly once per user — right after their first-ever completed
+    # Finalize. See finalize.is_first_finalize's docstring for why this is
+    # derived from trip_versions, not the credit_ledger charge.
+    is_first_finalize: bool
+
+
+@app.get("/credits", response_model=CreditsResponse)
+async def get_credits(session: sessions.Session = Depends(sessions.get_session)):
+    if session.user_id is None:
+        raise HTTPException(status_code=401, detail="Требуется вход.")
+    balance = await finalize.get_balance(session.user_id)
+    first = await finalize.is_first_finalize(session.user_id)
+    return CreditsResponse(balance=balance, is_first_finalize=first)
+
+
 class StopsRequest(BaseModel):
     origin: LatLon
     destination: LatLon
@@ -590,6 +607,63 @@ async def enrich_route_endpoint(req: EnrichRouteRequest):
         return await enrichment.enrich_route(dto)
     except enrichment.EnrichmentError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+class FinalizedEndpointOut(BaseModel):
+    name: str | None
+    lat: float
+    lon: float
+
+
+class FinalizedStopOut(BaseModel):
+    id: int
+    name: str
+    category: str
+    rating: float | None
+    review_count: int | None
+    lat: float
+    lon: float
+    detour_s: int
+    why: str
+    tips: str | None
+    dates_note: str | None
+
+
+class FinalizedRouteOut(BaseModel):
+    duration_s: int
+    distance_km: float
+    shape: str
+    legs: list[DetailRouteLegOut]
+
+
+class FinalizedEnrichmentOut(BaseModel):
+    overview: str
+    warnings: list[str]
+    sources: list[SourceOut]
+
+
+class FinalizedTripOut(BaseModel):
+    origin: FinalizedEndpointOut
+    destination: FinalizedEndpointOut
+    stops: list[FinalizedStopOut]
+    route: FinalizedRouteOut
+    days: list[DayOut]
+    enrichment: FinalizedEnrichmentOut
+    trip_dates: str | None
+    finalized_at: str
+    is_first_finalize: bool
+
+
+# Immutable, self-contained result of Finalize (подшаг 3) — built entirely
+# from trip_versions.snapshot, never draft_state (which may have kept
+# changing since). Same indistinguishable-404 ownership check as get_trip.
+@app.get("/trips/{trip_id}/finalized", response_model=FinalizedTripOut)
+async def get_finalized_trip(trip_id: uuid.UUID, session: sessions.Session = Depends(sessions.get_session)):
+    snapshot = await finalize.get_finalized_snapshot(session.id, session.user_id, trip_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Финализированная версия не найдена.")
+    first = await finalize.is_first_finalize(session.user_id) if session.user_id else False
+    return FinalizedTripOut(**snapshot, is_first_finalize=first)
 
 
 class CompareRoutesRequest(BaseModel):

@@ -49,6 +49,12 @@ export interface TripMapProps {
   // Closes whatever popup is open — plain map click or a different marker click.
   onClosePopup: () => void;
   onToggleStop: (id: number) => void;
+  // Finalized-trip view (Фаза 3, подшаг 3): immutable, no edits possible.
+  // Hides the stop popup's include/exclude checkbox and stops the A/B
+  // endpoint markers from being draggable — everything else (route lines,
+  // day segments, stop selection for panning) renders exactly the same as
+  // 'plan'. Defaults false so every existing 'plan'-phase caller is unchanged.
+  readOnly?: boolean;
 }
 
 // Route-line color — a rich, saturated blue distinct from the endpoint-marker
@@ -116,12 +122,13 @@ const EndpointMarker: React.FC<{
   label: string;
   color: string;
   onDragEnd: (lat: number, lng: number) => void;
-}> = ({ position, label, color, onDragEnd }) => (
+  readOnly?: boolean;
+}> = ({ position, label, color, onDragEnd, readOnly }) => (
   <AdvancedMarker
     position={position}
-    draggable
+    draggable={!readOnly}
     onDragEnd={(e) => {
-      if (e.latLng) {
+      if (!readOnly && e.latLng) {
         onDragEnd(e.latLng.lat(), e.latLng.lng());
       }
     }}
@@ -138,7 +145,7 @@ const EndpointMarker: React.FC<{
         alignItems: 'center',
         justifyContent: 'center',
         boxShadow: '0 1px 3px rgba(0,0,0,0.5)',
-        cursor: 'grab',
+        cursor: readOnly ? 'default' : 'grab',
       }}
     >
       <span style={{ transform: 'rotate(-45deg)', color: '#f2ede3', fontSize: '10px', fontWeight: 700 }}>
@@ -156,7 +163,8 @@ const StopPopup: React.FC<{
   marker: PlanMapMarker;
   onToggleStop: (id: number) => void;
   onClose: () => void;
-}> = ({ marker, onToggleStop, onClose }) => {
+  readOnly?: boolean;
+}> = ({ marker, onToggleStop, onClose, readOnly }) => {
   const { stop, included, order } = marker;
   const ABOUT_PREVIEW_LEN = 200;
   const aboutPreview = stop.about
@@ -169,12 +177,14 @@ const StopPopup: React.FC<{
     <InfoWindow position={{ lat: stop.lat, lng: stop.lon }} onCloseClick={onClose}>
       <div style={{ color: '#14171a', minWidth: '200px', maxWidth: '240px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-          <input
-            type="checkbox"
-            checked={included}
-            onChange={() => onToggleStop(stop.id)}
-            style={{ cursor: 'pointer' }}
-          />
+          {!readOnly && (
+            <input
+              type="checkbox"
+              checked={included}
+              onChange={() => onToggleStop(stop.id)}
+              style={{ cursor: 'pointer' }}
+            />
+          )}
           {included && order !== null && (
             <span
               style={{
@@ -307,7 +317,8 @@ export const TripMap: React.FC<TripMapProps> = ({
   selectedStopId,
   onSelectStop,
   onClosePopup,
-  onToggleStop
+  onToggleStop,
+  readOnly = false,
 }) => {
   // Tracks the map's current zoom so stop-marker labels can be hidden below
   // STOP_LABEL_MIN_ZOOM (see comment above) — must be declared before the
@@ -397,10 +408,10 @@ export const TripMap: React.FC<TripMapProps> = ({
 
           {/* Origin/destination endpoint markers */}
           {originCoord && (
-            <EndpointMarker position={originCoord} label="A" color="#4a90d9" onDragEnd={onOriginDragEnd} />
+            <EndpointMarker position={originCoord} label="A" color="#4a90d9" onDragEnd={onOriginDragEnd} readOnly={readOnly} />
           )}
           {destCoord && (
-            <EndpointMarker position={destCoord} label="B" color="#b968c7" onDragEnd={onDestDragEnd} />
+            <EndpointMarker position={destCoord} label="B" color="#b968c7" onDragEnd={onDestDragEnd} readOnly={readOnly} />
           )}
 
           {/* Plan-phase stop markers: accent + order number when included, muted when not.
@@ -500,7 +511,7 @@ export const TripMap: React.FC<TripMapProps> = ({
           {selectedStopId !== null && (() => {
             const marker = planMarkers.find(m => m.stop.id === selectedStopId);
             if (!marker) return null;
-            return <StopPopup marker={marker} onToggleStop={onToggleStop} onClose={onClosePopup} />;
+            return <StopPopup marker={marker} onToggleStop={onToggleStop} onClose={onClosePopup} readOnly={readOnly} />;
           })()}
 
           {/* FitBounds & selected-stop centering controller */}

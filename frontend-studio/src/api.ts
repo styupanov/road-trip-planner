@@ -596,3 +596,130 @@ export async function logout(): Promise<void> {
     throw new Error(body?.detail || `Logout failed: ${res.status}`);
   }
 }
+
+export interface CreditsResult {
+  balance: number;
+  // True exactly once, right after this user's first-ever completed
+  // Finalize — see finalize.is_first_finalize's docstring on the backend for
+  // why this is derived from trip_versions, not the credit ledger charge.
+  is_first_finalize: boolean;
+}
+
+export async function getCredits(): Promise<CreditsResult> {
+  const res = await fetch(`${API_URL}/credits`, { credentials: 'include' });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Get credits failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export interface FinalizeResult {
+  job_id: string;
+  status: string;
+  trip_version_id: string | null;
+  error: string | null;
+}
+
+// idempotencyKey is generated ONCE when the confirm screen opens (App.tsx),
+// not per click/retry — the backend's start_finalization treats a replayed
+// key as "return the existing job", so retrying a failed request with the
+// SAME key is exactly the safe behavior a flaky network needs, never a
+// double charge.
+export async function postFinalizeTrip(tripId: string, idempotencyKey: string): Promise<FinalizeResult> {
+  const res = await fetch(`${API_URL}/trips/${tripId}/finalize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+    credentials: 'include',
+    body: JSON.stringify({}),
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    // insufficient_credits (402) carries a structured detail — surfaced as a
+    // plain string here, the paywall gate check earlier should have already
+    // prevented reaching this in practice.
+    const detail = body?.detail;
+    const message = typeof detail === 'string' ? detail : detail?.error || `Finalize request failed: ${res.status}`;
+    throw new Error(message);
+  }
+
+  return res.json();
+}
+
+export async function getFinalizeStatus(jobId: string): Promise<FinalizeResult> {
+  const res = await fetch(`${API_URL}/finalize/${jobId}/status`, { credentials: 'include' });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Get finalize status failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export interface FinalizedEndpoint {
+  name: string | null;
+  lat: number;
+  lon: number;
+}
+
+export interface FinalizedStop {
+  id: number;
+  name: string;
+  category: string;
+  rating: number | null;
+  review_count: number | null;
+  lat: number;
+  lon: number;
+  detour_s: number;
+  // Same "LLM never invents route numbers" contract as EnrichedStop above —
+  // these three are the only free-text fields here.
+  why: string;
+  tips: string | null;
+  dates_note: string | null;
+}
+
+export interface FinalizedRoute {
+  // Exact, from Google — never labeled "(оценка)" anywhere this is shown,
+  // unlike the draft's Valhalla-estimated numbers (see PlanPanel).
+  duration_s: number;
+  distance_km: number;
+  // Google precision-5 polyline — decode with decodeGoogleShape, never decodeShape.
+  shape: string;
+  legs: DetailRouteLeg[];
+}
+
+export interface FinalizedEnrichment {
+  overview: string;
+  warnings: string[];
+  sources: EnrichSource[];
+}
+
+export interface FinalizedTripResult {
+  origin: FinalizedEndpoint;
+  destination: FinalizedEndpoint;
+  stops: FinalizedStop[];
+  route: FinalizedRoute;
+  days: DayResult[];
+  enrichment: FinalizedEnrichment;
+  trip_dates: string | null;
+  finalized_at: string;
+  is_first_finalize: boolean;
+}
+
+// Self-contained — built entirely from trip_versions.snapshot on the backend,
+// never draft_state (which may have kept changing since finalization). Same
+// indistinguishable-404 ownership check as getTrip.
+export async function getFinalizedTrip(tripId: string): Promise<FinalizedTripResult> {
+  const res = await fetch(`${API_URL}/trips/${tripId}/finalized`, { credentials: 'include' });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Get finalized trip failed: ${res.status}`);
+  }
+
+  return res.json();
+}
