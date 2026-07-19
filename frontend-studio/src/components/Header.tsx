@@ -2,22 +2,36 @@ import React, { useState, useEffect, useRef } from 'react';
 
 export interface HeaderProps {
   tripTitle: string;
+  // Driven by the real server autosave now (App.tsx), not localStorage —
+  // 'unsaved' means a change just happened and the debounced save hasn't
+  // fired yet, not "you'll lose this if you don't click Save" (there's no
+  // manual Save anymore, saving is unconditional).
   saveState: 'saved' | 'saving' | 'unsaved';
-  hasChanges: boolean;
-  onSave: () => void;
   onTitleChange: (newTitle: string) => void;
-  onOpenTrips: () => void;
   onNewTrip: () => void;
+  // Фаза 2 auth state — whether the CURRENT session is linked to a Google
+  // account (App.tsx's authState, from GET /auth/me). Not a separate login
+  // system: same rtp_session cookie either way, see auth.py's claim logic.
+  authenticated: boolean;
+  userEmail: string | null;
+  onLoginClick: () => void;
+  onLogoutClick: () => void;
+  // Opens "Мои поездки" if signed in, or the same sign-in modal if not —
+  // App.tsx's handleMyTripsClick decides which, this button never checks
+  // `authenticated` itself.
+  onMyTripsClick: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   tripTitle,
   saveState,
-  hasChanges,
-  onSave,
   onTitleChange,
-  onOpenTrips,
   onNewTrip,
+  authenticated,
+  userEmail,
+  onLoginClick,
+  onLogoutClick,
+  onMyTripsClick,
 }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [editVal, setEditVal] = useState(tripTitle);
@@ -107,24 +121,39 @@ export const Header: React.FC<HeaderProps> = ({
       {/* Right Actions */}
       <div className="flex items-center gap-3.5 flex-shrink-0">
         
-        {/* Save Indicator */}
+        {/* Save Indicator — autosave is unconditional now, no manual Save button */}
         <span className={`font-mono text-[10px] select-none ${saveIndicatorClass}`}>
           {saveIndicatorText}
         </span>
 
-        {/* Save Button (shows only when hasChanges or unsaved) */}
-        {hasChanges && (
+        {/* Auth — email + Выйти once signed in, otherwise Войти (opens the
+            same Google sign-in modal Finalize does, see App.tsx). */}
+        {authenticated ? (
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-[#8b9199] font-mono truncate max-w-[160px]" title={userEmail ?? undefined}>
+              {userEmail}
+            </span>
+            <button
+              onClick={onLogoutClick}
+              className="px-3 py-1.5 text-xs font-semibold rounded bg-[#2c3138] border border-[#3a4048] text-[#f2ede3] hover:bg-[#3a4048] transition-colors cursor-pointer"
+            >
+              Выйти
+            </button>
+          </div>
+        ) : (
           <button
-            onClick={onSave}
-            className="px-3 py-1.5 text-xs font-semibold rounded bg-[#e8b53f] text-[#14171a] hover:bg-[#d4a230] transition-colors cursor-pointer"
+            onClick={onLoginClick}
+            className="px-3 py-1.5 text-xs font-semibold rounded bg-[#2c3138] border border-[#3a4048] text-[#f2ede3] hover:bg-[#3a4048] transition-colors cursor-pointer"
           >
-            Сохранить
+            Войти
           </button>
         )}
 
-        {/* My Trips Button */}
+        {/* My Trips — live now (Фаза 2, шаг 3). Not signed in yet? clicking
+            still works, App.tsx's handleMyTripsClick routes to the sign-in
+            modal instead of the list. */}
         <button
-          onClick={onOpenTrips}
+          onClick={onMyTripsClick}
           className="px-3 py-1.5 text-xs font-semibold rounded bg-[#2c3138] border border-[#3a4048] text-[#f2ede3] hover:bg-[#3a4048] transition-colors cursor-pointer"
         >
           Мои поездки

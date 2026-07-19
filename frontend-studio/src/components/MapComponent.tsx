@@ -1,11 +1,8 @@
 import React from 'react';
-import { TripMap } from './TripMap';
+import { TripMap, PlanMapMarker } from './TripMap';
 
 interface MapComponentProps {
-  activeStopIndex: number | null;
-  onStopClick: (index: number) => void;
-  removedIndices: number[];
-  phase: 'quiz' | 'refine' | 'gen' | 'ready';
+  phase: 'quiz' | 'refine' | 'generating' | 'plan';
   generationStep: number;
   routeLine: Array<{ lat: number; lng: number }>;
   originCoord: { lat: number; lng: number } | null;
@@ -14,12 +11,19 @@ interface MapComponentProps {
   onDestDragEnd: (lat: number, lng: number) => void;
   pickingField: 'origin' | 'dest' | null;
   onMapClick: (lat: number, lng: number) => void;
+  planRouteLines: Array<{ points: Array<{ lat: number; lng: number }>; isActive: boolean }>;
+  planMarkers: PlanMapMarker[];
+  // Day-colored replacement for the active option's line in planRouteLines —
+  // only non-empty once /detail-route has run for it (see App.tsx comment).
+  activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string }>;
+  dayBoundaryMarkers: Array<{ position: { lat: number; lng: number }; color: string; label: string }>;
+  selectedStopId: number | null;
+  onSelectStop: (id: number) => void;
+  onClosePopup: () => void;
+  onToggleStop: (id: number) => void;
 }
 
 export const MapComponent: React.FC<MapComponentProps> = ({
-  activeStopIndex,
-  onStopClick,
-  removedIndices,
   phase,
   generationStep,
   routeLine,
@@ -28,22 +32,24 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   onOriginDragEnd,
   onDestDragEnd,
   pickingField,
-  onMapClick
+  onMapClick,
+  planRouteLines,
+  planMarkers,
+  activeDaySegments,
+  dayBoundaryMarkers,
+  selectedStopId,
+  onSelectStop,
+  onClosePopup,
+  onToggleStop
 }) => {
-  // Determine what map elements to draw based on current phase and step
-  const drawPath = phase === 'ready' || (phase === 'gen' && generationStep >= 0);
-  const drawStops = phase === 'ready' || (phase === 'gen' && generationStep >= 2);
-  const drawOvernights = phase === 'ready';
+  // 'generating' shows a live single-line preview while the plan overlay isn't
+  // ready yet; 'plan' switches entirely to the multi-option overlay below.
+  const drawPath = phase === 'generating' && generationStep >= 0;
 
   return (
     <div className="relative w-full h-full">
       <TripMap
-        activeStopIndex={activeStopIndex}
-        onStopClick={onStopClick}
-        removedIndices={removedIndices}
         drawPath={drawPath}
-        drawStops={drawStops}
-        drawOvernights={drawOvernights}
         path={routeLine}
         originCoord={originCoord}
         destCoord={destCoord}
@@ -51,6 +57,14 @@ export const MapComponent: React.FC<MapComponentProps> = ({
         onDestDragEnd={onDestDragEnd}
         pickingField={pickingField}
         onMapClick={onMapClick}
+        planRouteLines={phase === 'plan' ? planRouteLines : []}
+        planMarkers={phase === 'plan' ? planMarkers : []}
+        activeDaySegments={phase === 'plan' ? activeDaySegments : []}
+        dayBoundaryMarkers={phase === 'plan' ? dayBoundaryMarkers : []}
+        selectedStopId={selectedStopId}
+        onSelectStop={onSelectStop}
+        onClosePopup={onClosePopup}
+        onToggleStop={onToggleStop}
       />
     </div>
   );

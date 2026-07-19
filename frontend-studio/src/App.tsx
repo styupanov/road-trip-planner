@@ -1,13 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { QuizQuestion, Day, ChatMessage, Stop, SavedTrip } from './types';
-import { QUIZ, DAYS, COORDS, OVERNIGHTS, LINE } from './data';
+import { ChatMessage, QuizAnswerValue } from './types';
+import { QUIZ } from './data';
 import { MapComponent } from './components/MapComponent';
 import { GenerationProgress } from './components/GenerationProgress';
 import { Header } from './components/Header';
-import { listTrips, getTrip, saveTrip, deleteTrip, archiveTrip } from './storage';
-import { TripsList } from './components/TripsList';
-import { buildGoogleMapsUrl, buildAppleMapsUrl, getExportDayData } from './export';
-import { fetchRoute, decodeShape, geocode, reverseGeocode } from './api';
+import { GoogleSignInButton } from './components/GoogleSignInButton';
+import { MyTripsModal } from './components/MyTripsModal';
+import {
+  getCompareRoutes, postRouteThrough, postDetailRoute, postEnrichRoute, getWhoAmI,
+  saveTrip, getCurrentTrip, getMyTrips, getTrip, deleteTrip, loginWithGoogle, getMe, logout,
+  decodeShape, decodeGoogleShape, geocode, reverseGeocode,
+  ApiStop, RouteOption, DetailRouteResult, EnrichRouteResult, TripProject, TripSummary,
+} from './api';
+import { mapDetourToMaxDetourS, mapDriveToDailyLimitS, mapInterestsToCategories, mapPaceToApiPace } from './quizMapping';
+import { dayColor } from './dayColors';
+import { splitPathIntoLegs } from './routeSegments';
+import { PlanPanel, RouteThroughSummary } from './components/PlanPanel';
+import { DateModal } from './components/DateModal';
 
 // Default/fallback coordinates, used for route building if geocoding never resolves.
 // Must stay within Colorado — Valhalla's tiles only cover this state.
@@ -25,28 +34,45 @@ interface FieldGeocodeState {
 }
 const EMPTY_GEO_STATE: FieldGeocodeState = { text: '', status: 'unresolved', error: '', source: null };
 
+// JSON-safe shape of TripProject.draft_state (api.ts) — the frontend's own
+// contract, opaque to the backend. Map/Set values are serialized as entries
+// arrays since JSON has neither. Deliberately excludes detailedByOption/
+// enrichedByOption: Google detail-route and Gemini enrichment are billable
+// and belong to Finalize (Phase 2), not a free autosaved draft — day_split
+// is cheap enough to just recompute client-side from the restored legs
+// instead of caching it here (see PlanPanel, which already does this on the
+// fly whenever `detail` is present).
+interface DraftStateSnapshot {
+  version: 1;
+  options: RouteOption[];
+  activeOptionIndex: number;
+  includedByOption: [number, number[]][];
+  routeThroughByOption: [number, RouteThroughSummary][];
+  routeOrigin: { lat: number; lng: number } | null;
+  routeDest: { lat: number; lng: number } | null;
+}
+
 export default function App() {
   // Application Phase
-  const [phase, setPhase] = useState<'quiz' | 'refine' | 'gen' | 'ready'>('quiz');
+  const [phase, setPhase] = useState<'quiz' | 'refine' | 'generating' | 'plan'>('quiz');
 
   // Quiz State
   const [step, setStep] = useState<number>(0);
-  const [answers, setAnswers] = useState<Record<string, string | string[]>>({});
+  const [answers, setAnswers] = useState<Record<string, QuizAnswerValue>>({});
 
-  // Storage and Header State
-  const [currentTripId, setCurrentTripId] = useState<string | null>(null);
-  const [currentTripCreatedAt, setCurrentTripCreatedAt] = useState<string | null>(null);
+  // Server-side draft persistence (Фаза 1, шаг 3) — replaces the old
+  // localStorage-backed save/trips-list entirely, not alongside it.
+  const [tripProjectId, setTripProjectId] = useState<string | null>(null);
   const [tripTitle, setTripTitle] = useState<string>('Новая поездка');
   const [isTitleManuallyEdited, setIsTitleManuallyEdited] = useState<boolean>(false);
   const [saveState, setSaveState] = useState<'saved' | 'saving' | 'unsaved'>('saved');
-  const [hasChanges, setHasChanges] = useState<boolean>(false);
-  const [showTripsList, setShowTripsList] = useState<boolean>(false);
-  const [savedTripsList, setSavedTripsList] = useState<SavedTrip[]>([]);
-  const [deletingTripId, setDeletingTripId] = useState<string | null>(null);
+  // The session's most recent draft, fetched once on mount — powers the
+  // "Продолжить поездку" banner. Never applied automatically; the user has to
+  // click it (see the banner's onClick) so a fresh quiz never gets silently
+  // clobbered by an old draft.
+  const [resumableTrip, setResumableTrip] = useState<TripProject | null>(null);
+  const [resumeBannerDismissed, setResumeBannerDismissed] = useState<boolean>(false);
   const [showConfirmNewTrip, setShowConfirmNewTrip] = useState<boolean>(false);
-
-  // Ref to track if state changes are due to a trip loading / initializing
-  const isInternalUpdate = useRef<boolean>(false);
 
   // Sequence counters guarding against out-of-order geocode/reverse-geocode responses
   // (e.g. a slow forward-geocode resolving after a later drag already set a better coordinate)
@@ -58,9 +84,52 @@ export default function App() {
   const [inputText, setInputText] = useState<string>('');
 
   // Itinerary State
-  const [days, setDays] = useState<Day[]>(JSON.parse(JSON.stringify(DAYS)));
-  const [removedIndices, setRemovedIndices] = useState<number[]>([]);
-  const [routeLine, setRouteLine] = useState<{ lat: number; lng: number }[]>(LINE);
+  const [routeLine, setRouteLine] = useState<{ lat: number; lng: number }[]>([]);
+  // Route alternatives from /compare-routes, all shown/editable simultaneously in
+  // the 'plan' phase — no separate "choose a route" step.
+  const [options, setOptions] = useState<RouteOption[]>([]);
+  const [activeOptionIndex, setActiveOptionIndex] = useState<number>(0);
+  // Per-option checkbox state — editing one option's stops never touches another's.
+  const [includedByOption, setIncludedByOption] = useState<Map<number, Set<number>>>(new Map());
+  // Per-option through-route result (real total_s/delta_s/through_shape), populated
+  // initially from /compare-routes' own suggested-stop computation, then refreshed
+  // per-option whenever that option's checkboxes change.
+  const [routeThroughByOption, setRouteThroughByOption] = useState<Map<number, RouteThroughSummary>>(new Map());
+  // Which option currently has an in-flight /route-through request, or null — used to
+  // show a non-blocking "recomputing" indicator only on the tab it actually applies to.
+  const [loadingOptionIndex, setLoadingOptionIndex] = useState<number | null>(null);
+  const routeThroughAbortRef = useRef<AbortController | null>(null);
+  // Debounce timer for the server autosave effect further down.
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Per-option Google Directions detail — exact numbers, distinct from the Valhalla-
+  // estimated routeThroughByOption above. Isolated by option like includedByOption:
+  // detailing option 0 never touches option 1's state. An entry is removed the moment
+  // that option's checkboxes change (see handleToggleStop) since it's now stale.
+  const [detailedByOption, setDetailedByOption] = useState<Map<number, DetailRouteResult>>(new Map());
+  // Which option currently has an in-flight /detail-route request, or null.
+  const [detailLoadingOptionIndex, setDetailLoadingOptionIndex] = useState<number | null>(null);
+  // Per-option Gemini enrichment — same isolation rule as detailedByOption: keyed
+  // by option, cleared for that option the moment its checkboxes change.
+  const [enrichedByOption, setEnrichedByOption] = useState<Map<number, EnrichRouteResult>>(new Map());
+  // Which option currently has an in-flight /enrich-route request, or null.
+  const [enrichLoadingOptionIndex, setEnrichLoadingOptionIndex] = useState<number | null>(null);
+  const [showDateModal, setShowDateModal] = useState<boolean>(false);
+  const [selectedStopId, setSelectedStopId] = useState<number | null>(null);
+  // Origin/destination actually used to build the current itinerary — snapshotted at
+  // generation time, independent of the draggable A/B markers' live originCoord/destCoord
+  const [routeOrigin, setRouteOrigin] = useState<{ lat: number; lng: number } | null>(null);
+  const [routeDest, setRouteDest] = useState<{ lat: number; lng: number } | null>(null);
+  // Read by tryFinishGeneration (see startGeneration) once it's called, to know the
+  // fetched options — a ref because the fetch and the fixed-duration animation are
+  // two independent async chains and the check needs the latest value without
+  // waiting on a re-render.
+  const pendingOptionsRef = useRef<RouteOption[] | null>(null);
+  // Rendezvous flags for startGeneration's animation-vs-fetch race: the transition to
+  // 'plan' only fires once BOTH the fetch has resolved (pendingOptionsRef set) AND the
+  // minimum animation duration has elapsed (animationDoneRef set) — whichever finishes
+  // second triggers it. generationTransitionedRef guards against firing twice.
+  const animationDoneRef = useRef<boolean>(false);
+  const generationTransitionedRef = useRef<boolean>(false);
   const [originCoord, setOriginCoord] = useState<{ lat: number; lng: number } | null>(null);
   const [destCoord, setDestCoord] = useState<{ lat: number; lng: number } | null>(null);
   const [originGeo, setOriginGeo] = useState<FieldGeocodeState>(EMPTY_GEO_STATE);
@@ -68,8 +137,6 @@ export default function App() {
   const [quizNextLoading, setQuizNextLoading] = useState<boolean>(false);
   // Which field a "pick on the map" click will set, or null when not in picking mode
   const [pickingField, setPickingField] = useState<'origin' | 'dest' | null>(null);
-  const [activeStopIndex, setActiveStopIndex] = useState<number | null>(null);
-  const [expandedDays, setExpandedDays] = useState<number[]>([1]); // Day 1 open by default
 
   // Generation Timer State
   const [generationStep, setGenerationStep] = useState<number>(0);
@@ -77,12 +144,30 @@ export default function App() {
   // Summary Modifiers
   const [detourSummary, setDetourSummary] = useState<string>('');
 
-  // Auth Modal State
-  const [showModal, setShowModal] = useState<boolean>(false);
+  // Same modal for both "Finalize" (PlanPanel) and the header's "Войти" —
+  // Google sign-in either way, see handleGoogleCredential. Closing it never
+  // touches the draft; it's a plain overlay over whatever screen was showing.
+  const [showFinalizeModal, setShowFinalizeModal] = useState<boolean>(false);
+  const [authModalError, setAuthModalError] = useState<string | null>(null);
+
+  // Auth state (Фаза 2) — who the CURRENT session is linked to, if anyone.
+  // Fetched once on mount via getMe(); updated in place by
+  // handleGoogleCredential (login) and handleLogoutClick (logout), never
+  // touching phase/options/tripProjectId — signing in/out never navigates
+  // away from whatever trip is currently open.
+  const [authState, setAuthState] = useState<{ authenticated: boolean; email: string | null }>({
+    authenticated: false,
+    email: null,
+  });
+
+  // "Мои поездки" (Фаза 2, шаг 3) — only ever fetched while the modal is
+  // open (see the effect below), not kept warm in the background.
+  const [showMyTripsModal, setShowMyTripsModal] = useState<boolean>(false);
+  const [myTrips, setMyTrips] = useState<TripSummary[]>([]);
+  const [isMyTripsLoading, setIsMyTripsLoading] = useState<boolean>(false);
 
   // Refs for scrolling and auto-scroll chat
   const streamRef = useRef<HTMLDivElement>(null);
-  const cardRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll stream when messages or stop selection change
   useEffect(() => {
@@ -91,17 +176,46 @@ export default function App() {
     }
   }, [messages, phase, step]);
 
-  // Scroll details card into view when active stop changes
+  // Fetches the session's most recent draft on mount, purely to offer the
+  // "Продолжить поездку" banner — never applied automatically (see
+  // resumableTrip's own comment). A failure here just means no banner shows;
+  // starting a fresh quiz still works fine either way.
   useEffect(() => {
-    if (activeStopIndex !== null && cardRef.current) {
-      cardRef.current.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
-  }, [activeStopIndex]);
-
-  // Load saved trips on mount
-  useEffect(() => {
-    setSavedTripsList(listTrips());
+    getCurrentTrip()
+      .then(trip => setResumableTrip(trip))
+      .catch(err => console.error('Failed to fetch current draft:', err));
   }, []);
+
+  // Establishes the anonymous session (rtp_session cookie) on first load —
+  // nothing reads the result yet (Фаза 1, шаг 2 is just wiring the plumbing
+  // through), but the request has to actually fire once for the backend to
+  // ever set the cookie in the first place. Failure is non-fatal — the rest
+  // of the app works without a session, just without persistence tied to it.
+  useEffect(() => {
+    getWhoAmI().catch(err => console.error('Failed to establish session:', err));
+  }, []);
+
+  // Фаза 2: is the current session linked to a Google account? Drives the
+  // header (email + "Выйти" vs "Войти"). A page reload lands here again —
+  // this is what makes "reload, still logged in" work, there's no separate
+  // client-side token to persist, the rtp_session cookie already carries it.
+  useEffect(() => {
+    getMe()
+      .then(me => setAuthState({ authenticated: me.authenticated, email: me.email }))
+      .catch(err => console.error('Failed to fetch auth state:', err));
+  }, []);
+
+  // Fetches the list only while "Мои поездки" is actually open — not kept
+  // warm in the background, and re-fetched fresh every time it opens (so a
+  // trip finalized/deleted elsewhere doesn't show stale).
+  useEffect(() => {
+    if (!showMyTripsModal) return;
+    setIsMyTripsLoading(true);
+    getMyTrips()
+      .then(list => setMyTrips(list))
+      .catch(err => console.error('Failed to fetch my trips:', err))
+      .finally(() => setIsMyTripsLoading(false));
+  }, [showMyTripsModal]);
 
   // Map picking mode is quiz-only — never let it linger into another phase
   useEffect(() => {
@@ -118,17 +232,6 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [pickingField]);
 
-  // Auto-save effect: every 30 seconds if there are unsaved changes
-  useEffect(() => {
-    if (!hasChanges || phase === 'quiz') return;
-
-    const timer = setInterval(() => {
-      handleSave();
-    }, 30000);
-
-    return () => clearInterval(timer);
-  }, [hasChanges, phase, answers, days, removedIndices, tripTitle, currentTripId, currentTripCreatedAt, isTitleManuallyEdited]);
-
   // Auto-generate title from origin and dest if not manually edited
   useEffect(() => {
     if (!isTitleManuallyEdited) {
@@ -141,13 +244,6 @@ export default function App() {
       }
     }
   }, [answers.origin, answers.dest, isTitleManuallyEdited]);
-
-  // Helper for short uppercase labels
-  const short = (s: string | string[] | undefined) => {
-    if (!s) return '';
-    const text = Array.isArray(s) ? s.join(', ') : s;
-    return text.slice(0, 3).toUpperCase();
-  };
 
   // Quiz Actions
   const currentQuestion = QUIZ[step];
@@ -187,6 +283,28 @@ export default function App() {
     });
   };
 
+  const DAYS_MIN = 1;
+  const DAYS_MAX = 14;
+
+  const daysValue = (): number => {
+    const val = answers.days;
+    if (typeof val === 'number') return val;
+    if (typeof currentQuestion.def === 'number') return currentQuestion.def;
+    return 4;
+  };
+
+  const handleDaysStep = (delta: number) => {
+    setAnswers(prev => {
+      const current = typeof prev.days === 'number' ? prev.days : daysValue();
+      const next = Math.min(DAYS_MAX, Math.max(DAYS_MIN, current + delta));
+      return { ...prev, days: next };
+    });
+  };
+
+  const handleFlexibleDaysToggle = (checked: boolean) => {
+    setAnswers(prev => ({ ...prev, flexible_days: checked }));
+  };
+
   const isCurrentStepValid = () => {
     if (currentQuestion.k === 'avoid') return true; // optional
     const val = answers[currentQuestion.k];
@@ -198,6 +316,9 @@ export default function App() {
     }
     if (currentQuestion.type === 'many') {
       return Array.isArray(val) && val.length > 0;
+    }
+    if (currentQuestion.type === 'days') {
+      return true; // stepper always has a value (state or def) — nothing to validate
     }
     return false;
   };
@@ -256,7 +377,7 @@ export default function App() {
       setGeoState({ text: result.name, status: 'resolved', error: '', source: 'drag' });
       setAnswers(prev => ({ ...prev, [field]: result.name }));
 
-      if (phase === 'ready') {
+      if (phase === 'plan') {
         const dragCoord = { lat, lng };
         if (field === 'origin') {
           startGeneration(dragCoord, destCoord ?? TRIP_DEST);
@@ -298,7 +419,7 @@ export default function App() {
     }
 
     if (isLocationStep) {
-      const text = typeof rawVal === 'string' && rawVal.trim() !== '' ? rawVal : currentQuestion.def || '';
+      const text = typeof rawVal === 'string' && rawVal.trim() !== '' ? rawVal : (currentQuestion.def as string | undefined) || '';
       setQuizNextLoading(true);
       const ok = await resolveFieldCoords(currentQuestion.k as 'origin' | 'dest', text);
       setQuizNextLoading(false);
@@ -319,140 +440,90 @@ export default function App() {
     }
   };
 
-  // Save Trip action
-  const handleSave = () => {
-    setSaveState('saving');
-    setTimeout(() => {
-      try {
-        const originVal = answers.origin ? (Array.isArray(answers.origin) ? answers.origin[0] : answers.origin) : 'Денвер';
-        const destVal = answers.dest ? (Array.isArray(answers.dest) ? answers.dest[0] : answers.dest) : 'Лас-Вегас';
-        const title = tripTitle || `${originVal} → ${destVal}`;
-
-        const tripToSave: SavedTrip = {
-          id: currentTripId || `trip_${Date.now()}`,
-          title,
-          origin: originVal,
-          dest: destVal,
-          status: phase === 'ready' ? 'ready' : 'draft',
-          answers,
-          plan: phase === 'ready' ? { days, version: 1, removedIndices } : null,
-          createdAt: currentTripCreatedAt || new Date().toISOString(),
-          updatedAt: new Date().toISOString()
-        };
-
-        const saved = saveTrip(tripToSave);
-        
-        isInternalUpdate.current = true;
-        setCurrentTripId(saved.id);
-        setCurrentTripCreatedAt(saved.createdAt);
-        setHasChanges(false);
-        setSaveState('saved');
-        
-        setSavedTripsList(listTrips());
-      } catch (e) {
-        console.error(e);
-        setSaveState('unsaved');
-      }
-    }, 300);
-  };
-
-  // Load selected trip from directory
-  const handleLoadTrip = (trip: SavedTrip) => {
-    isInternalUpdate.current = true;
-    setPickingField(null); // don't carry map-picking mode over into the loaded trip
-    setCurrentTripId(trip.id);
-    setCurrentTripCreatedAt(trip.createdAt);
-    setTripTitle(trip.title);
+  // Restores a draft fetched from the server (see resumableTrip/the
+  // "Продолжить поездку" banner) exactly as it was — unlike the old
+  // localStorage version, this does NOT regenerate the route live from
+  // scratch (which used to silently reset custom checkbox toggles back to
+  // the suggested set). options/includedByOption/routeThroughByOption come
+  // straight from draft_state, so the restored plan is byte-for-byte what
+  // was last autosaved. Google detail-route and Gemini enrichment were never
+  // in the draft (see TripProject.draft_state) — those just come back empty,
+  // same as a freshly built route that hasn't been detailed/enriched yet.
+  const handleRestoreDraft = (trip: TripProject) => {
+    setPickingField(null);
+    setTripProjectId(trip.id);
+    setTripTitle(trip.title || 'Новая поездка');
     setIsTitleManuallyEdited(true);
-    setAnswers(trip.answers);
-    setRouteLine(LINE);
-    setOriginCoord(null);
-    setDestCoord(null);
+    setAnswers((trip.quiz_answers as Record<string, QuizAnswerValue>) || {});
     setOriginGeo(EMPTY_GEO_STATE);
     setDestGeo(EMPTY_GEO_STATE);
-    // Invalidate any in-flight geocode/drag requests from before this trip was loaded
     originRequestSeq.current += 1;
     destRequestSeq.current += 1;
 
-    if (trip.plan) {
-      setDays(trip.plan.days);
-      setRemovedIndices(trip.plan.removedIndices || []);
-      setPhase('ready');
-      
-      const totalStopsCount = trip.plan.days.reduce((acc, d) => acc + d.stops.length, 0);
-      setMessages([
-        { id: `ready-bot-init`, sender: 'bot', text: `Маршрут готов: ${trip.plan.days.length} дней, ${totalStopsCount} остановок. Ни один день не превышает ваш лимит.` }
-      ]);
-    } else {
-      setPhase('refine');
-      setDays(JSON.parse(JSON.stringify(DAYS)));
-      setRemovedIndices([]);
-      
-      const interestsStr = (trip.answers.interests as string[] || ['каньоны']).join(', ');
-      const userPromptText = `Я хочу спланировать поездку из ${trip.answers.origin || 'Денвер'} в ${trip.answers.dest || 'Лас-Вегас'} на ${trip.answers.days || '5–6'} дней. Люблю ${interestsStr}.`;
-      const botWelcomeText = 'Так я понял вашу поездку. Можно уточнить в чате. Когда готовы, нажмите «Построить маршрут».';
-      setMessages([
-        { id: 'refine-user-init', sender: 'user', text: userPromptText },
-        { id: 'refine-bot-init', sender: 'bot', text: botWelcomeText }
-      ]);
+    const draft = (trip.draft_state || {}) as Partial<DraftStateSnapshot>;
+    const restoredOptions = draft.options ?? [];
+    const restoredActiveIndex = draft.activeOptionIndex ?? 0;
+    const restoredIncluded = new Map<number, Set<number>>(
+      (draft.includedByOption ?? []).map(([idx, ids]) => [idx, new Set(ids)])
+    );
+    const restoredThrough = new Map<number, RouteThroughSummary>(draft.routeThroughByOption ?? []);
 
-      const originText = Array.isArray(trip.answers.origin) ? trip.answers.origin[0] : trip.answers.origin;
-      const destText = Array.isArray(trip.answers.dest) ? trip.answers.dest[0] : trip.answers.dest;
-      Promise.all([
-        resolveFieldCoords('origin', originText || 'Денвер'),
-        resolveFieldCoords('dest', destText || 'Дуранго')
-      ]).then(([originOk, destOk]) => {
-        if (!originOk || !destOk) {
-          setMessages(prev => [...prev, {
-            id: `geocode-error-${Date.now()}`,
-            sender: 'bot',
-            text: 'Не удалось определить координаты отправления или назначения. Построение маршрута может использовать точки по умолчанию.'
-          }]);
-        }
-      });
-    }
+    setOptions(restoredOptions);
+    setActiveOptionIndex(restoredActiveIndex);
+    setIncludedByOption(restoredIncluded);
+    setRouteThroughByOption(restoredThrough);
+    setDetailedByOption(new Map());
+    setDetailLoadingOptionIndex(null);
+    setEnrichedByOption(new Map());
+    setEnrichLoadingOptionIndex(null);
+    setLoadingOptionIndex(null);
+    routeThroughAbortRef.current?.abort();
+    setSelectedStopId(null);
+    setRouteOrigin(draft.routeOrigin ?? null);
+    setRouteDest(draft.routeDest ?? null);
+    setOriginCoord(draft.routeOrigin ?? null);
+    setDestCoord(draft.routeDest ?? null);
+    setRouteLine([]);
+    setShowDateModal(false);
 
-    setActiveStopIndex(null);
-    setExpandedDays([1]);
-    setHasChanges(false);
+    const primaryIncluded = restoredIncluded.get(restoredActiveIndex)?.size ?? 0;
+    setMessages([{
+      id: 'plan-bot-restored',
+      sender: 'bot',
+      text: restoredOptions.length > 0
+        ? `Поездка восстановлена${restoredOptions.length > 1 ? `: ${restoredOptions.length} варианта` : ''}. В активном варианте ${primaryIncluded} остановок включено.`
+        : 'Черновик восстановлен.',
+    }]);
+
+    setPhase('plan');
+    setResumableTrip(null);
+    setResumeBannerDismissed(true);
     setSaveState('saved');
-    setShowTripsList(false);
-  };
-
-  // Archive trip action
-  const handleArchiveTrip = (id: string) => {
-    archiveTrip(id);
-    setSavedTripsList(listTrips());
-    if (currentTripId === id) {
-      const updated = getTrip(id);
-      if (updated) {
-        isInternalUpdate.current = true;
-        setPhase(updated.status === 'ready' ? 'ready' : 'refine');
-      }
-    }
-  };
-
-  // Delete trip action
-  const handleDeleteTripAction = (id: string) => {
-    deleteTrip(id);
-    setSavedTripsList(listTrips());
-    if (currentTripId === id) {
-      // Current trip was deleted, trigger standard reset
-      resetAllToNewQuiz();
-    }
   };
 
   // Reset function to start new trip
   const resetAllToNewQuiz = () => {
-    isInternalUpdate.current = true;
     setPhase('quiz');
     setStep(0);
     setAnswers({});
     setMessages([]);
     setInputText('');
-    setDays(JSON.parse(JSON.stringify(DAYS)));
-    setRemovedIndices([]);
-    setRouteLine(LINE);
+    setOptions([]);
+    setActiveOptionIndex(0);
+    setIncludedByOption(new Map());
+    setRouteThroughByOption(new Map());
+    setLoadingOptionIndex(null);
+    setDetailedByOption(new Map());
+    setDetailLoadingOptionIndex(null);
+    setEnrichedByOption(new Map());
+    setEnrichLoadingOptionIndex(null);
+    setShowDateModal(false);
+    setSelectedStopId(null);
+    routeThroughAbortRef.current?.abort();
+    setRouteOrigin(null);
+    setRouteDest(null);
+    pendingOptionsRef.current = null;
+    setRouteLine([]);
     setOriginCoord(null);
     setDestCoord(null);
     setOriginGeo(EMPTY_GEO_STATE);
@@ -460,22 +531,20 @@ export default function App() {
     // Invalidate any in-flight geocode/drag requests from the trip being reset
     originRequestSeq.current += 1;
     destRequestSeq.current += 1;
-    setActiveStopIndex(null);
-    setExpandedDays([1]);
     setGenerationStep(0);
     setDetourSummary('');
-    setCurrentTripId(null);
-    setCurrentTripCreatedAt(null);
+    setTripProjectId(null);
     setTripTitle('Новая поездка');
     setIsTitleManuallyEdited(false);
-    setHasChanges(false);
     setSaveState('saved');
-    setShowTripsList(false);
   };
 
   // Confirm and start a new trip
   const handleNewTripClick = () => {
-    if (hasChanges) {
+    // A built route is autosaved, but once "new trip" replaces it, the old
+    // draft stops being the one /trips/current (and the resume banner) would
+    // offer — confirm before quietly making it unreachable this session.
+    if (phase !== 'quiz') {
       setShowConfirmNewTrip(true);
     } else {
       resetAllToNewQuiz();
@@ -508,74 +577,196 @@ export default function App() {
       { id: 'refine-bot-init', sender: 'bot', text: botWelcomeText }
     ]);
 
-    // Save draft trip to localStorage right after quiz completion
-    try {
-      const originVal = currentAnswers.origin ? (Array.isArray(currentAnswers.origin) ? currentAnswers.origin[0] : currentAnswers.origin) : 'Денвер';
-      const destVal = currentAnswers.dest ? (Array.isArray(currentAnswers.dest) ? currentAnswers.dest[0] : currentAnswers.dest) : 'Лас-Вегас';
-      const title = `${originVal} → ${destVal}`;
+    // No autosave here on purpose — the trigger list is "построение маршрута,
+    // переключение варианта, вкл/выкл остановки" (see the debounced autosave
+    // effect below), all of which only happen once options exist in 'plan'.
+    // Nothing worth persisting exists yet at 'refine'.
+  };
 
-      const draftId = `trip_${Date.now()}`;
-      const draftTrip: SavedTrip = {
-        id: draftId,
-        title,
-        origin: originVal,
-        dest: destVal,
-        status: 'draft',
-        answers: currentAnswers,
-        plan: null,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
+  // Finalize itself (spending a credit) isn't wired up yet — this just opens
+  // the same sign-in modal the header's "Войти" uses. Once auth exists in the
+  // UI, clicking Finalize while already authenticated would move on to an
+  // actual charge; that branch doesn't exist yet, only the sign-in gate does.
+  const handleFinalizeClick = () => {
+    setAuthModalError(null);
+    setShowFinalizeModal(true);
+  };
 
-      const saved = saveTrip(draftTrip);
-      
-      setCurrentTripId(saved.id);
-      setCurrentTripCreatedAt(saved.createdAt);
-      setTripTitle(saved.title);
-      setHasChanges(false);
-      setSaveState('saved');
-      setSavedTripsList(listTrips());
-    } catch (e) {
-      console.error('Error saving draft trip after quiz:', e);
+  const handleLoginClick = () => {
+    setAuthModalError(null);
+    setShowFinalizeModal(true);
+  };
+
+  // GoogleSignInButton's callback — `credential` is the raw ID token (JWT),
+  // never trusted here: /auth/google verifies it against Google's own public
+  // keys before doing anything (auth.py). On success the session's cookie is
+  // unchanged (same anonymous session, now claimed — see auth.py's claim
+  // logic), so phase/options/tripProjectId all stay exactly as they were:
+  // the user lands back on the same 'plan' screen with the same trip, never
+  // an empty dashboard.
+  const handleGoogleCredential = (credential: string) => {
+    loginWithGoogle(credential)
+      .then(result => {
+        setAuthState({ authenticated: true, email: result.email });
+        setShowFinalizeModal(false);
+        setAuthModalError(null);
+      })
+      .catch(err => {
+        console.error('Google sign-in failed:', err);
+        setAuthModalError('Не удалось войти. Попробуйте ещё раз.');
+      });
+  };
+
+  const handleLogoutClick = () => {
+    logout()
+      .then(() => setAuthState({ authenticated: false, email: null }))
+      .catch(err => console.error('Logout failed:', err));
+  };
+
+  // Header's "Мои поездки" — needs a real account (the list is by
+  // owner_user_id, an anonymous session has no list, only "the current
+  // draft"). Not signed in yet -> same sign-in modal Finalize/"Войти" use.
+  const handleMyTripsClick = () => {
+    if (!authState.authenticated) {
+      setAuthModalError(null);
+      setShowFinalizeModal(true);
+      return;
     }
+    setShowMyTripsModal(true);
   };
 
-  // Modal / Auth actions
-  const handleBuildRouteClick = () => {
-    setShowModal(true);
+  // Opening a trip from the list uses the exact same restore path as the
+  // "Продолжить поездку" banner (handleRestoreDraft) — same draft_state
+  // shape, same exact-restore guarantee, just reached from a different list.
+  const handleOpenTripFromList = (id: string) => {
+    getTrip(id)
+      .then(trip => {
+        setShowMyTripsModal(false);
+        handleRestoreDraft(trip);
+      })
+      .catch(err => console.error('Failed to open trip:', err));
   };
 
-  const handleAuthConfirm = () => {
-    setShowModal(false);
-    startGeneration();
+  const handleDeleteTripFromList = (id: string) => {
+    deleteTrip(id)
+      .then(() => setMyTrips(prev => prev.filter(t => t.id !== id)))
+      .catch(err => console.error('Failed to delete trip:', err));
   };
 
-  // Start Generation Phase. Accepts coordinate overrides so a marker drag can trigger a
-  // rebuild with its just-resolved coordinate without waiting for a re-render to land in
-  // originCoord/destCoord state (which this closure would otherwise read stale).
+  // Enters the 'plan' phase with the fetched route options: seeds per-option
+  // included-stop sets from `suggested`, seeds per-option through-route results from
+  // whatever compare_routes already computed server-side (no redundant /route-through
+  // calls), and persists the active (first) option as the trip's saved plan.
+  const enterPlan = (
+    opts: RouteOption[],
+    origin: { lat: number; lng: number },
+    dest: { lat: number; lng: number }
+  ) => {
+    const initialIncluded = new Map<number, Set<number>>();
+    const initialThrough = new Map<number, RouteThroughSummary>();
+    opts.forEach((option, idx) => {
+      initialIncluded.set(idx, new Set(option.stops.filter(s => s.suggested).map(s => s.id)));
+      if (option.through_shape && option.total_s != null && option.delta_s != null) {
+        initialThrough.set(idx, {
+          total_s: option.total_s,
+          delta_s: option.delta_s,
+          through_shape: option.through_shape,
+        });
+      }
+    });
+
+    setOptions(opts);
+    setActiveOptionIndex(0);
+    setIncludedByOption(initialIncluded);
+    setRouteThroughByOption(initialThrough);
+    setSelectedStopId(null);
+    setPhase('plan');
+
+    const primaryIncluded = initialIncluded.get(0)?.size ?? 0;
+    const botReadyText = opts.length > 0
+      ? `Маршрут готов${opts.length > 1 ? `: ${opts.length} варианта` : ''}. В первом варианте ${primaryIncluded} остановок включено.`
+      : 'Не удалось построить маршрут по этим условиям.';
+    setMessages([{ id: 'plan-bot-init', sender: 'bot', text: botReadyText }]);
+    // Autosave picks this up on its own — see the debounced effect below,
+    // which watches options/activeOptionIndex/includedByOption and fires
+    // once options just went from empty to populated, exactly as here.
+  };
+
+  // Start Generation Phase. Accepts coordinate + answers overrides so a marker drag or
+  // a saved-trip reload can trigger a rebuild without waiting for a re-render to land
+  // in originCoord/destCoord/answers state (which this closure would otherwise read stale).
   const startGeneration = (
     originOverride?: { lat: number; lng: number } | null,
-    destOverride?: { lat: number; lng: number } | null
+    destOverride?: { lat: number; lng: number } | null,
+    answersOverride?: Record<string, QuizAnswerValue>
   ) => {
-    setPhase('gen');
+    setPhase('generating');
     setGenerationStep(0);
 
     const botGeneratingText = 'Строю маршрут. Каждая точка проверяется по реальной дорожной сети.';
     setMessages(prev => [...prev, { id: `gen-bot-${Date.now()}`, sender: 'bot', text: botGeneratingText }]);
 
-    // Fetch the real route geometry from the backend; fall back to the static LINE on failure
     const origin = originOverride ?? originCoord ?? TRIP_ORIGIN;
     const dest = destOverride ?? destCoord ?? TRIP_DEST;
-    fetchRoute(origin.lat, origin.lng, dest.lat, dest.lng)
+    const effectiveAnswers = answersOverride ?? answers;
+
+    setOptions([]);
+    setActiveOptionIndex(0);
+    setIncludedByOption(new Map());
+    setRouteThroughByOption(new Map());
+    setLoadingOptionIndex(null);
+    setDetailedByOption(new Map());
+    setDetailLoadingOptionIndex(null);
+    setEnrichedByOption(new Map());
+    setEnrichLoadingOptionIndex(null);
+    setShowDateModal(false);
+    setSelectedStopId(null);
+    routeThroughAbortRef.current?.abort();
+    setRouteOrigin(origin);
+    setRouteDest(dest);
+    setRouteLine([]);
+    pendingOptionsRef.current = null;
+    animationDoneRef.current = false;
+    generationTransitionedRef.current = false;
+
+    // Rendezvous: the fetch (getCompareRoutes below) and the fixed-duration progress
+    // animation (the setInterval below) are two independent async chains. Whichever
+    // finishes SECOND calls this, and it only actually transitions once both sides
+    // are ready — this removes any assumption about which one is faster.
+    const tryFinishGeneration = () => {
+      if (generationTransitionedRef.current) return;
+      if (!animationDoneRef.current) return;
+      const opts = pendingOptionsRef.current;
+      if (opts === null) return; // fetch hasn't resolved yet
+      generationTransitionedRef.current = true;
+      enterPlan(opts, origin, dest);
+    };
+
+    getCompareRoutes({
+      origin: { lat: origin.lat, lon: origin.lng },
+      destination: { lat: dest.lat, lon: dest.lng },
+      categories: mapInterestsToCategories(effectiveAnswers.interests as string[] | undefined),
+      max_detour_s: mapDetourToMaxDetourS(effectiveAnswers.detour as string | undefined),
+      pace: mapPaceToApiPace(effectiveAnswers.pace as string | undefined),
+    })
       .then(result => {
-        setRouteLine(decodeShape(result.shape));
+        pendingOptionsRef.current = result.options;
+        // Live preview line for the remainder of the generating animation
+        const primary = result.options[0];
+        if (primary) {
+          setRouteLine(decodeShape(primary.route_shape));
+        }
+        tryFinishGeneration();
       })
       .catch(err => {
-        console.error('Failed to fetch route, falling back to static line:', err);
-        setRouteLine(LINE);
+        console.error('Failed to fetch route comparison:', err);
+        pendingOptionsRef.current = [];
+        tryFinishGeneration();
       });
 
-    // Sequential timing simulation matching the HTML prototype
+    // Sequential timing simulation matching the HTML prototype — this is a minimum
+    // display duration for the progress steps, NOT what triggers the phase change
+    // (see tryFinishGeneration above).
     let currentStep = 0;
     const interval = setInterval(() => {
       currentStep += 1;
@@ -584,51 +775,11 @@ export default function App() {
       } else {
         clearInterval(interval);
         setTimeout(() => {
-          startReady();
+          animationDoneRef.current = true;
+          tryFinishGeneration();
         }, 600);
       }
     }, 550);
-  };
-
-  // Ready Phase
-  const startReady = () => {
-    setPhase('ready');
-
-    const totalStopsCount = DAYS.reduce((acc, d) => acc + d.stops.length, 0);
-    const botReadyText = `Маршрут готов: ${DAYS.length} дней, ${totalStopsCount} остановок. Ни один день не превышает ваш лимит. Откройте точку, чтобы увидеть, почему она здесь.`;
-
-    setMessages([
-      { id: `ready-bot-init`, sender: 'bot', text: botReadyText }
-    ]);
-
-    // Save trip with status "ready" and plan
-    try {
-      const originVal = answers.origin ? (Array.isArray(answers.origin) ? answers.origin[0] : answers.origin) : 'Денвер';
-      const destVal = answers.dest ? (Array.isArray(answers.dest) ? answers.dest[0] : answers.dest) : 'Лас-Вегас';
-      const title = isTitleManuallyEdited ? tripTitle : `${originVal} → ${destVal}`;
-
-      const readyTrip: SavedTrip = {
-        id: currentTripId || `trip_${Date.now()}`,
-        title,
-        origin: originVal,
-        dest: destVal,
-        status: 'ready',
-        answers,
-        plan: { days, version: 1, removedIndices },
-        createdAt: currentTripCreatedAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      };
-
-      const saved = saveTrip(readyTrip);
-      
-      setCurrentTripId(saved.id);
-      setCurrentTripCreatedAt(saved.createdAt);
-      setHasChanges(false);
-      setSaveState('saved');
-      setSavedTripsList(listTrips());
-    } catch (e) {
-      console.error('Error saving ready trip:', e);
-    }
   };
 
   // Chat Responses State Machine
@@ -652,10 +803,9 @@ export default function App() {
   };
 
   const respondToChat = (text: string) => {
-    let botReplyText = 'Понял. Пересчитываю затронутый день…';
+    let botReplyText = 'Понял. Что-то ещё уточнить?';
 
     if (phase === 'refine') {
-      setHasChanges(true);
       setSaveState('unsaved');
       if (text.includes('моаб')) {
         botReplyText = 'Добавил Моаб как обязательную точку. Учту при построении.';
@@ -666,29 +816,9 @@ export default function App() {
       } else {
         botReplyText = 'Учёл. Что-то ещё уточнить перед построением?';
       }
-    } else if (phase === 'ready') {
-      setHasChanges(true);
+    } else if (phase === 'plan') {
       setSaveState('unsaved');
-      if (text.includes('музей')) {
-        const museumStopIndex = 3; // "Музей Юты"
-        if (!removedIndices.includes(museumStopIndex)) {
-          removeStop(museumStopIndex);
-          botReplyText = 'Убрал музей из второго дня. Освободилось 1 ч 15 — день стал свободнее.';
-        } else {
-          botReplyText = 'Музея во втором дне уже нет.';
-        }
-      } else if (text.includes('плотн')) {
-        // Toggle Day 2 (index 1) dense mode
-        setDays(prev => prev.map((d, i) => i === 1 ? { ...d, dense: true } : d));
-        botReplyText = 'Второй день: 3:55 за рулём плюс 3 ч на остановки. Это близко к пределу. Могу убрать одну точку или перенести ночёвку ближе — что предпочитаете?';
-      } else if (text.includes('крюк') || text.includes('45')) {
-        setDetourSummary('до 45 мин');
-        botReplyText = 'Поднял лимит крюка до 45 минут. Появились новые кандидаты — Dead Horse Point и Kodachrome Basin. Добавить?';
-      } else if (text.includes('ночёвк') || text.includes('ночевк')) {
-        botReplyText = 'Перенёс ночёвку ближе к Zion — Спрингдейл вместо Кейнаба. Пятый день стал короче на 40 минут.';
-      } else if (text.includes('удали') || text.includes('убери')) {
-        botReplyText = 'Какую именно точку убрать? Нажмите на неё в списке или назовите.';
-      }
+      botReplyText = 'Изменить состав остановок можно в списке справа от карты — там же виден пересчитанный крюк.';
     }
 
     setMessages(prev => [...prev, {
@@ -698,132 +828,380 @@ export default function App() {
     }]);
   };
 
-  // Remove Stop Action
-  const removeStop = (stopIdx: number) => {
-    setRemovedIndices(prev => {
-      if (prev.includes(stopIdx)) return prev;
-      return [...prev, stopIdx];
-    });
-
-    if (activeStopIndex === stopIdx) {
-      setActiveStopIndex(null);
-    }
-
-    setHasChanges(true);
-    setSaveState('unsaved');
-
-    // Append system message in chronological order
-    setMessages(prev => [...prev, {
-      id: `sys-remove-${Date.now()}`,
-      sender: 'sys',
-      text: 'Остановка удалена. День пересчитан.'
-    }]);
+  // Selects a stop marker/row — just pans the map, doesn't change checkbox state.
+  const handleSelectStop = (id: number) => {
+    setSelectedStopId(id);
   };
 
-  // Toggle Day Accordion Expansion
-  const toggleDayExpanded = (dayNum: number) => {
-    setExpandedDays(prev =>
-      prev.includes(dayNum)
-        ? prev.filter(n => n !== dayNum)
-        : [...prev, dayNum]
-    );
-  };
+  // Recomputes the through-route for the given option's included stops. `optionIndex`
+  // is captured explicitly (not read from activeOptionIndex at resolve time) so that
+  // if the user has since switched tabs, the result still lands on the option it was
+  // actually requested for. Cancels any in-flight /route-through request first, same
+  // as before — a fast double-click can't have an older response land after a newer one.
+  const recomputeRouteThrough = (
+    optionIndex: number,
+    stopIds: Set<number>,
+    stopsList: ApiStop[],
+    origin: { lat: number; lng: number },
+    dest: { lat: number; lng: number }
+  ) => {
+    routeThroughAbortRef.current?.abort();
+    const controller = new AbortController();
+    routeThroughAbortRef.current = controller;
 
-  // Select Stop Details
-  const handleSelectStop = (stopIdx: number, dayNum: number) => {
-    setActiveStopIndex(stopIdx);
-    // Auto expand parent day
-    if (!expandedDays.includes(dayNum)) {
-      setExpandedDays(prev => [...prev, dayNum]);
-    }
-  };
+    const orderedStops = stopsList
+      .filter(s => stopIds.has(s.id))
+      .sort((a, b) => a.to_poi_s - b.to_poi_s);
 
-  // Determine Stop Data by selected index
-  let selectedStop: Stop | null = null;
-  let selectedStopDay: Day | null = null;
-  if (activeStopIndex !== null) {
-    days.forEach(d => {
-      d.stops.forEach(s => {
-        if (s.i === activeStopIndex) {
-          selectedStop = s;
-          selectedStopDay = d;
-        }
+    setLoadingOptionIndex(optionIndex);
+    postRouteThrough(
+      {
+        origin: { lat: origin.lat, lon: origin.lng },
+        destination: { lat: dest.lat, lon: dest.lng },
+        stops: orderedStops.map(s => ({ lat: s.lat, lon: s.lon })),
+      },
+      controller.signal
+    )
+      .then(result => {
+        setRouteThroughByOption(prev => {
+          const next = new Map(prev);
+          next.set(optionIndex, {
+            total_s: result.total_s,
+            delta_s: result.delta_s,
+            through_shape: result.route_shape,
+          });
+          return next;
+        });
+        setLoadingOptionIndex(current => (current === optionIndex ? null : current));
+      })
+      .catch(err => {
+        if (err?.name === 'AbortError') return; // superseded by a newer toggle
+        console.error('Failed to recompute route through stops:', err);
+        setLoadingOptionIndex(current => (current === optionIndex ? null : current));
       });
-    });
-  }
+  };
 
-  // Prebaked chat hints for different phases
-  const getHints = () => {
-    if (phase === 'refine') {
-      return ["С нами ребёнок 8 лет", "Обязательно заехать в Моаб", "Хайки максимум 2 мили"];
+  // Toggles a stop's inclusion for the ACTIVE option only — other options' checkbox
+  // state is untouched, so switching tabs and back preserves whatever was edited.
+  const handleToggleStop = (stopId: number) => {
+    const optionIndex = activeOptionIndex;
+    const current = includedByOption.get(optionIndex) ?? new Set<number>();
+    const next = new Set<number>(current);
+    if (next.has(stopId)) {
+      next.delete(stopId);
+    } else {
+      next.add(stopId);
     }
-    if (phase === 'ready') {
-      return ["Убери музей во втором дне", "Второй день слишком плотный", "Разреши крюк до 45 минут"];
+
+    setIncludedByOption(prev => {
+      const updated = new Map(prev);
+      updated.set(optionIndex, next);
+      return updated;
+    });
+
+    // The checkbox set changed, so any Google detail already fetched for this
+    // option is now stale (it was computed for the OLD stop set) — drop it. The
+    // UI falls back to the Valhalla estimate and "Детализировать" becomes
+    // available again for this option.
+    setDetailedByOption(prev => {
+      if (!prev.has(optionIndex)) return prev;
+      const updated = new Map(prev);
+      updated.delete(optionIndex);
+      return updated;
+    });
+
+    // Same reasoning for enrichment — it was written for the old stop set (and
+    // the old Google numbers), so it's stale the instant the checkboxes change.
+    // Dropping it also hides the enrichment text and re-shows "Рассказать о
+    // маршруте" only once detailing has been redone (the button's own gating).
+    setEnrichedByOption(prev => {
+      if (!prev.has(optionIndex)) return prev;
+      const updated = new Map(prev);
+      updated.delete(optionIndex);
+      return updated;
+    });
+
+    if (routeOrigin && routeDest) {
+      const stopsList = options[optionIndex]?.stops ?? [];
+      recomputeRouteThrough(optionIndex, next, stopsList, routeOrigin, routeDest);
     }
-    return [];
+  };
+
+  // Точка входа отключена до Фазы 3, запускается через Finalize — this and
+  // handleConfirmEnrich below are NOT called from the UI anymore (see
+  // PlanPanel's single "Финализировать поездку" button, wired to
+  // handleFinalizeClick instead). Both functions, detailedByOption/
+  // enrichedByOption state, and PlanPanel's day-grouping/enrichment-card
+  // rendering are left fully intact — Finalize reuses this exact code path
+  // after a real credit charge, it just isn't reachable for free anymore.
+  //
+  // Fetches exact Google Directions numbers for the active option's currently
+  // included stops. `optionIndex` is captured at call time (same pattern as
+  // recomputeRouteThrough) so a tab switch while the request is in flight can't
+  // make the response land on the wrong option.
+  const handleDetailize = () => {
+    if (!routeOrigin || !routeDest) return;
+    const optionIndex = activeOptionIndex;
+    const included = includedByOption.get(optionIndex) ?? new Set<number>();
+    const stopsList = options[optionIndex]?.stops ?? [];
+    const orderedStops = stopsList
+      .filter(s => included.has(s.id))
+      .sort((a, b) => a.to_poi_s - b.to_poi_s);
+
+    setDetailLoadingOptionIndex(optionIndex);
+    postDetailRoute({
+      origin: { lat: routeOrigin.lat, lon: routeOrigin.lng },
+      destination: { lat: routeDest.lat, lon: routeDest.lng },
+      stops: orderedStops.map(s => ({ lat: s.lat, lon: s.lon })),
+      daily_limit_s: mapDriveToDailyLimitS(answers.drive as string | undefined),
+      planned_days: typeof answers.days === 'number' ? answers.days : null,
+      flexible_days: !!answers.flexible_days,
+    })
+      .then(result => {
+        setDetailedByOption(prev => {
+          const updated = new Map(prev);
+          updated.set(optionIndex, result);
+          return updated;
+        });
+        setDetailLoadingOptionIndex(current => (current === optionIndex ? null : current));
+      })
+      .catch(err => {
+        console.error('Failed to fetch Google Directions detail:', err);
+        setDetailLoadingOptionIndex(current => (current === optionIndex ? null : current));
+      });
+  };
+
+  const handleOpenEnrichModal = () => {
+    setShowDateModal(true);
+  };
+
+  // Fetches Gemini enrichment for the active option's currently included stops
+  // (same set just used for /detail-route, in the same order). optionIndex is
+  // captured at call time — same reasoning as handleDetailize — so a tab switch
+  // mid-request can't land the response on the wrong option.
+  const handleConfirmEnrich = (tripDates: string | null) => {
+    setShowDateModal(false);
+    const optionIndex = activeOptionIndex;
+    const detail = detailedByOption.get(optionIndex);
+    if (!detail) return; // the button is only shown once this exists, but stay defensive
+
+    const included = includedByOption.get(optionIndex) ?? new Set<number>();
+    const stopsList = options[optionIndex]?.stops ?? [];
+    const orderedStops = stopsList
+      .filter(s => included.has(s.id))
+      .sort((a, b) => a.to_poi_s - b.to_poi_s);
+
+    setEnrichLoadingOptionIndex(optionIndex);
+    postEnrichRoute({
+      origin_name: originVal || 'Денвер',
+      destination_name: destVal || 'Дуранго',
+      trip_dates: tripDates,
+      // All numbers here are Google's exact figures from the detail this option
+      // already has — never re-derived, never estimated, so the DTO Gemini sees
+      // matches exactly what the UI is showing the user.
+      total_duration_s: detail.duration_s,
+      baseline_duration_s: detail.baseline_s,
+      delta_s: detail.delta_s,
+      distance_km: detail.distance_km,
+      stops: orderedStops.map(s => ({
+        id: s.id,
+        name: s.name,
+        category: s.category,
+        rating: s.rating,
+        review_count: s.review_count,
+        detour_s: s.detour_s,
+        duration_raw: s.duration,
+        about: s.about,
+        website: s.website,
+      })),
+    })
+      .then(result => {
+        setEnrichedByOption(prev => {
+          const updated = new Map(prev);
+          updated.set(optionIndex, result);
+          return updated;
+        });
+        setEnrichLoadingOptionIndex(current => (current === optionIndex ? null : current));
+      })
+      .catch(err => {
+        console.error('Failed to fetch route enrichment:', err);
+        setEnrichLoadingOptionIndex(current => (current === optionIndex ? null : current));
+      });
   };
 
   // Origin & destination header labels
   const originVal = answers.origin ? (Array.isArray(answers.origin) ? answers.origin[0] : answers.origin) : '';
   const destVal = answers.dest ? (Array.isArray(answers.dest) ? answers.dest[0] : answers.dest) : '';
 
+  // Map overlay for the 'plan' phase: every option's base line, active one swapped
+  // for its through-route (the route actually taken with its included stops) so the
+  // highlighted line reflects the current checkbox state, not just the raw option.
+  // If that active option has been detailed via Google, its EXACT polyline wins over
+  // the Valhalla through-route — but it's precision 5, decoded with a different
+  // function (decodeGoogleShape), never decodeShape (precision 6, Valhalla-only).
+  const planRouteLinesForMap = options.map((option, idx) => {
+    const isActive = idx === activeOptionIndex;
+    if (!isActive) {
+      return { points: decodeShape(option.route_shape), isActive: false };
+    }
+    const detail = detailedByOption.get(idx);
+    if (detail) {
+      return { points: decodeGoogleShape(detail.shape), isActive: true };
+    }
+    const shape = routeThroughByOption.get(idx)?.through_shape ?? option.route_shape;
+    return { points: decodeShape(shape), isActive: true };
+  });
+
+  const activeOption = options[activeOptionIndex];
+  const activeIncludedForMap = includedByOption.get(activeOptionIndex) ?? new Set<number>();
+  const includedSortedForMap = (activeOption?.stops ?? [])
+    .filter(s => activeIncludedForMap.has(s.id))
+    .sort((a, b) => a.to_poi_s - b.to_poi_s);
+  const orderByIdForMap = new Map(includedSortedForMap.map((s, i) => [s.id, i + 1]));
+  const planMarkersForMap = (activeOption?.stops ?? []).map(stop => ({
+    stop,
+    included: activeIncludedForMap.has(stop.id),
+    order: orderByIdForMap.get(stop.id) ?? null,
+  }));
+
+  // Day-colored route segments + boundary markers for the active option — only
+  // exist once /detail-route has run (day_split needs Google's per-leg times,
+  // see day_split.py). `includedSortedForMap` is the exact same stop order
+  // sent to /detail-route (same included set, same to_poi_s sort), so
+  // detail.days[i].stop_indices index straight into it.
+  const activeDetailForMap = detailedByOption.get(activeOptionIndex);
+  let activeDaySegments: Array<{ points: { lat: number; lng: number }[]; color: string }> = [];
+  let dayBoundaryMarkersForMap: Array<{ position: { lat: number; lng: number }; color: string; label: string }> = [];
+
+  if (activeDetailForMap && routeOrigin && routeDest) {
+    const waypoints = [
+      routeOrigin,
+      ...includedSortedForMap.map(s => ({ lat: s.lat, lng: s.lon })),
+      routeDest,
+    ];
+    const path = decodeGoogleShape(activeDetailForMap.shape);
+    const legSegments = splitPathIntoLegs(path, waypoints);
+
+    const stopIndexToDay = new Map<number, number>();
+    activeDetailForMap.days.forEach((day, dayIdx) => {
+      day.stop_indices.forEach(si => stopIndexToDay.set(si, dayIdx));
+    });
+    const lastDayIdx = activeDetailForMap.days.length - 1;
+
+    activeDaySegments = legSegments.map((points, legIdx) => {
+      // A leg ending at a stop (legIdx < stop count) belongs to that stop's
+      // day; the final leg (into dest, no stop) always belongs to the last
+      // day — same "closes wherever it lands" rule as day_split.py itself.
+      const dayIdx = legIdx < includedSortedForMap.length
+        ? stopIndexToDay.get(legIdx) ?? lastDayIdx
+        : lastDayIdx;
+      return { points, color: dayColor(dayIdx) };
+    });
+
+    dayBoundaryMarkersForMap = activeDetailForMap.days.slice(1).map((day) => {
+      const dayIdx = day.day - 1;
+      const firstStop = includedSortedForMap[day.stop_indices[0]];
+      return firstStop
+        ? { position: { lat: firstStop.lat, lng: firstStop.lon }, color: dayColor(dayIdx), label: `Д${day.day}` }
+        : null;
+    }).filter((m): m is { position: { lat: number; lng: number }; color: string; label: string } => m != null);
+  }
+
+  // Server autosave (Фаза 1, шаг 3). Debounced trigger list, exactly:
+  // building the route (options going from empty to populated), switching
+  // the active option tab, and toggling a stop's checkbox — plus renaming
+  // the trip, which the user asked to have land in draft_state too. Nothing
+  // fires before 'plan' — there's nothing worth persisting during quiz/refine.
+  const buildDraftPayload = () => {
+    const originVal = answers.origin ? (Array.isArray(answers.origin) ? answers.origin[0] : answers.origin) : null;
+    const destVal = answers.dest ? (Array.isArray(answers.dest) ? answers.dest[0] : answers.dest) : null;
+
+    const draftState: DraftStateSnapshot = {
+      version: 1,
+      options,
+      activeOptionIndex,
+      includedByOption: Array.from(includedByOption.entries()).map(([idx, set]) => [idx, Array.from(set)]),
+      routeThroughByOption: Array.from(routeThroughByOption.entries()),
+      routeOrigin,
+      routeDest,
+    };
+
+    return {
+      title: tripTitle,
+      origin_name: typeof originVal === 'string' ? originVal : null,
+      destination_name: typeof destVal === 'string' ? destVal : null,
+      origin: routeOrigin ? { lat: routeOrigin.lat, lon: routeOrigin.lng } : null,
+      destination: routeDest ? { lat: routeDest.lat, lon: routeDest.lng } : null,
+      quiz_answers: answers as Record<string, unknown>,
+      draft_state: draftState as unknown as Record<string, unknown>,
+    };
+  };
+
+  const saveDraftNow = () => {
+    setSaveState('saving');
+    saveTrip({
+      trip_project_id: tripProjectId,
+      ...buildDraftPayload(),
+    })
+      .then(result => {
+        setTripProjectId(result.trip_project_id);
+        setSaveState('saved');
+      })
+      .catch(err => {
+        console.error('Failed to save draft:', err);
+        setSaveState('unsaved');
+      });
+  };
+
+  useEffect(() => {
+    if (phase !== 'plan' || options.length === 0) return;
+
+    setSaveState('unsaved');
+    if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    autosaveTimerRef.current = setTimeout(saveDraftNow, 1500);
+
+    return () => {
+      if (autosaveTimerRef.current) clearTimeout(autosaveTimerRef.current);
+    };
+  }, [phase, options, activeOptionIndex, includedByOption, tripTitle]);
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#22262b]">
       <Header
         tripTitle={tripTitle}
         saveState={saveState}
-        hasChanges={hasChanges}
-        onSave={handleSave}
         onTitleChange={(newTitle) => {
           setTripTitle(newTitle);
           setIsTitleManuallyEdited(true);
-          setHasChanges(true);
-        }}
-        onOpenTrips={() => {
-          setShowTripsList(true);
-          setSavedTripsList(listTrips());
         }}
         onNewTrip={handleNewTripClick}
+        authenticated={authState.authenticated}
+        userEmail={authState.email}
+        onLoginClick={handleLoginClick}
+        onLogoutClick={handleLogoutClick}
+        onMyTripsClick={handleMyTripsClick}
       />
 
       <div className="app flex-1 min-h-0">
         {/* LEFT PANEL: Console Control Panel */}
         <div className="panel w-full md:w-[420px] md:min-w-[420px] h-[58vh] md:h-full bg-asphalt flex flex-col min-w-0 border-r border-[#000000]">
-          
-          {showTripsList ? (
-            <TripsList
-              trips={savedTripsList}
-              onOpen={(id) => {
-                const tr = savedTripsList.find((t) => t.id === id);
-                if (tr) handleLoadTrip(tr);
-              }}
-              onArchive={(id) => {
-                handleArchiveTrip(id);
-              }}
-              onDelete={(id) => {
-                handleDeleteTripAction(id);
-              }}
-              onBack={() => setShowTripsList(false)}
-              onNew={() => {
-                setShowTripsList(false);
-                handleNewTripClick();
-              }}
-            />
-          ) : (
-            <>
-              {/* Header Head Section */}
-              <div className="head">
-                <h1 className="text-white">Текущий маршрут</h1>
-                {phase !== 'quiz' && (
-                  <span className="route" id="route-lbl">
-                    {short(originVal)} → {short(destVal)}
-                  </span>
-                )}
-              </div>
 
-              {/* Dynamic Trip Summary Bar */}
-              <div className={`summary ${['quiz', 'gen'].includes(phase) ? 'hidden' : ''}`} id="summary">
-                <div>дней<b>{answers.days || "5–6"}</b></div>
+          <>
+              {/* Dynamic Trip Summary Bar — trip title already lives in the header above
+                  (TripHeader), so this block doesn't repeat it, only the parameters
+                  that appear nowhere else in the UI. */}
+              <div className={`summary ${['quiz', 'generating'].includes(phase) ? 'hidden' : ''}`} id="summary">
+                <div className="w-full text-[9px] uppercase tracking-wide text-[#5a5f66] font-mono mb-0.5">
+                  Параметры поездки
+                </div>
+                <div>
+                  дней
+                  <b>
+                    {typeof answers.days === 'number'
+                      ? `${answers.days}${answers.flexible_days ? ' ±1' : ''}`
+                      : (answers.days as string) || '4'}
+                  </b>
+                </div>
                 <div>за рулём/день<b>{answers.drive || "до 4 ч"}</b></div>
                 <div>крюк<b>{detourSummary}</b></div>
                 <div>темп<b>{answers.pace || "спокойный"}</b></div>
@@ -831,10 +1209,46 @@ export default function App() {
 
               {/* Message Stream Scrollable Box */}
               <div className="stream flex-1 overflow-y-auto" ref={streamRef} id="stream">
-                
+
                 {/* Phase: QUIZ */}
                 {phase === 'quiz' && (
                   <div className="quiz">
+                    {/* "Продолжить поездку" — only at the very landing step, and only
+                        until the user explicitly acts (continue, or dismiss/×). Never
+                        auto-restores: a fresh quiz must never be silently replaced by
+                        an old draft, the user decides which one they want. */}
+                    {step === 0 && resumableTrip && !resumeBannerDismissed && (
+                      <div className="px-3 py-3 rounded bg-[#2c3138] border border-[#e8b53f]/40">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="text-[10px] uppercase tracking-wide text-[#e8b53f] font-mono mb-1">
+                              Есть незавершённая поездка
+                            </div>
+                            <div className="text-[13px] text-[#f2ede3] font-medium truncate">
+                              {resumableTrip.origin_name && resumableTrip.destination_name
+                                ? `${resumableTrip.origin_name} → ${resumableTrip.destination_name}`
+                                : resumableTrip.title || 'Черновик поездки'}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setResumeBannerDismissed(true)}
+                            className="text-[#8b9199] hover:text-[#f2ede3] text-sm leading-none cursor-pointer flex-shrink-0"
+                            aria-label="Скрыть"
+                          >
+                            ×
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleRestoreDraft(resumableTrip)}
+                          className="btn btn-y mt-2.5 w-full"
+                        >
+                          Продолжить поездку
+                        </button>
+                      </div>
+                    )}
+
                     <div className="q-prog">
                       ШАГ {step + 1} ИЗ {QUIZ.length}
                       <i>
@@ -842,7 +1256,7 @@ export default function App() {
                       </i>
                     </div>
                     <div className="q-text">{currentQuestion.q}</div>
-                    
+
                     <div id="q-body">
                       {currentQuestion.type === 'text' && (
                         <>
@@ -907,6 +1321,44 @@ export default function App() {
                           })}
                         </div>
                       )}
+
+                      {currentQuestion.type === 'days' && (
+                        <div className="flex flex-col gap-4">
+                          <div className="flex items-center gap-3">
+                            <button
+                              type="button"
+                              className="btn btn-g"
+                              onClick={() => handleDaysStep(-1)}
+                              disabled={daysValue() <= DAYS_MIN}
+                              aria-label="Меньше дней"
+                            >
+                              −
+                            </button>
+                            <span className="text-[28px] font-bold text-[#f2ede3] font-mono w-10 text-center">
+                              {daysValue()}
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-g"
+                              onClick={() => handleDaysStep(1)}
+                              disabled={daysValue() >= DAYS_MAX}
+                              aria-label="Больше дней"
+                            >
+                              +
+                            </button>
+                            <span className="text-[13px] text-[#8b9199]">дней</span>
+                          </div>
+                          <label className="flex items-center gap-2 text-[13px] text-[#c9cfd6] cursor-pointer select-none">
+                            <input
+                              type="checkbox"
+                              checked={!!answers.flexible_days}
+                              onChange={(e) => handleFlexibleDaysToggle(e.target.checked)}
+                              className="accent-[#e8b53f] cursor-pointer"
+                            />
+                            ±1 день гибкости
+                          </label>
+                        </div>
+                      )}
                     </div>
 
                     <div className="q-nav">
@@ -929,7 +1381,7 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Chat message threads (Refine, Gen, Ready) */}
+                {/* Chat message threads (Refine, Generating, Plan) */}
                 {phase !== 'quiz' && messages.map((msg) => (
                   <div
                     key={msg.id}
@@ -939,151 +1391,35 @@ export default function App() {
                   </div>
                 ))}
 
-                {/* Refine Action Building Button */}
+                {/* Refine Action Building Button — free, anonymous, no auth
+                    wall. The old "sign in to build" modal was removed here on
+                    purpose: the draft (Valhalla options + stops) is free
+                    value, and gating it behind auth was a wall before any
+                    value was shown. Only Finalize needs auth. */}
                 {phase === 'refine' && (
                   <button
                     className="btn btn-y mt-2 self-start"
-                    onClick={handleBuildRouteClick}
+                    onClick={() => startGeneration()}
                   >
                     Построить маршрут
                   </button>
                 )}
 
                 {/* Phase: GENERATING Progress bar and stepper */}
-                {phase === 'gen' && (
+                {phase === 'generating' && (
                   <GenerationProgress currentStep={generationStep} />
                 )}
 
-                {/* Phase: READY Day Itinerary Cards list */}
-                {phase === 'ready' && (
-                  <div className="space-y-3.5 w-full mt-2">
-                    {days.map((day) => {
-                      const isExpanded = expandedDays.includes(day.n);
-                      const visibleStops = day.stops.filter(s => !removedIndices.includes(s.i));
-
-                      return (
-                        <div
-                          key={day.n}
-                          className={`day ${isExpanded ? 'open' : ''} ${day.dense ? 'dense' : ''}`}
-                        >
-                          {/* Day Top Header Bar */}
-                          <div
-                            className="day-top"
-                            onClick={() => toggleDayExpanded(day.n)}
-                          >
-                            <span className="day-n">Д{day.n}</span>
-                            <span className="day-t">{day.t}</span>
-                            <span className="day-m">{day.drive}</span>
-                          </div>
-
-                          {/* Collapsible Day Body List */}
-                          {isExpanded && (
-                            <div className="day-body">
-                              {visibleStops.length > 0 ? (
-                                visibleStops.map((stop) => {
-                                  const isSelected = activeStopIndex === stop.i;
-                                  return (
-                                    <div
-                                      key={stop.i}
-                                      className={`stop ${isSelected ? 'sel' : ''}`}
-                                      onClick={() => handleSelectStop(stop.i, day.n)}
-                                    >
-                                      <span className="pin">{stop.i + 1}</span>
-                                      <span>
-                                        <span className="stop-n block">{stop.n}</span>
-                                        <span className="stop-c block">{stop.c}</span>
-                                        
-                                        <span className="detour">
-                                          <span className={`bar ${stop.w > 65 ? 'warn' : ''}`}>
-                                            <span style={{ width: `${stop.w}%` }} />
-                                          </span>
-                                          <em>+{stop.d} мин</em>
-                                        </span>
-                                      </span>
-                                    </div>
-                                  );
-                                })
-                              ) : (
-                                <div style={{ padding: '9px', fontSize: '12px', color: '#6c727a' }}>
-                                  Остановок нет
-                                </div>
-                              )}
-
-                              {/* Map export buttons row */}
-                              <div className="flex items-center gap-2 mt-3 pt-3 border-t border-[#e4dccd] justify-end px-2">
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    const exportDay = getExportDayData(day, removedIndices);
-                                    const url = buildGoogleMapsUrl(exportDay);
-                                    window.open(url, '_blank');
-                                  }}
-                                  className="bg-transparent border border-[#e4dccd] hover:border-[#c05640] text-[#3d434a] hover:text-[#c05640] transition-colors rounded px-2.5 py-1 text-[11px] font-medium cursor-pointer"
-                                >
-                                  Открыть в Google Maps
-                                </button>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    const exportDay = getExportDayData(day, removedIndices);
-                                    const url = buildAppleMapsUrl(exportDay);
-                                    window.open(url, '_blank');
-                                  }}
-                                  className="bg-transparent border border-[#e4dccd] hover:border-[#c05640] text-[#3d434a] hover:text-[#c05640] transition-colors rounded px-2.5 py-1 text-[11px] font-medium cursor-pointer"
-                                >
-                                  Открыть в Apple Maps
-                                </button>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Selected Stop Details Card in Stream viewport */}
-                {phase === 'ready' && selectedStop && selectedStopDay && (
-                  <div className="card mt-4 scroll-mt-2" ref={cardRef} id="card">
-                    <div className="cat">{(selectedStop as Stop).c}</div>
-                    <h3>{(selectedStop as Stop).n}</h3>
-                    
-                    <div className="facts">
-                      <div className="fact"><i>реальный крюк</i><b>+{(selectedStop as Stop).d} мин</b></div>
-                      <div className="fact"><i>на посещение</i><b>{(selectedStop as Stop).vis}</b></div>
-                      <div className="fact"><i>день</i><b>{(selectedStopDay as Day).n} из {days.length}</b></div>
-                      <div className="fact"><i>за рулём в день</i><b>{(selectedStopDay as Day).drive}</b></div>
-                    </div>
-
-                    <p className="why">{(selectedStop as Stop).why}</p>
-                    <span className="verify">Проверено · официальный источник</span>
-                    
-                    <div className="card-acts">
-                      <button onClick={() => removeStop((selectedStop as Stop).i)}>Удалить</button>
-                      <button onClick={() => handleSendText(`Замени ${(selectedStop as Stop).n} на что-то похожее`)}>Заменить</button>
-                      <button onClick={() => handleSendText(`Сделай ${(selectedStop as Stop).n} необязательной`)}>Сделать optional</button>
-                    </div>
-                  </div>
-                )}
-
               </div>
 
-              {/* Hints Buttons List Bar */}
-              <div className={`hints ${!['refine', 'ready'].includes(phase) ? 'hidden' : ''}`} id="hints">
-                {getHints().map((hText) => (
-                  <button
-                    key={hText}
-                    className="hint"
-                    onClick={() => handleSendText(hText)}
-                  >
-                    {hText}
-                  </button>
-                ))}
+              {/* Compose Chat Input Form — reserved for text-based route edits, not
+                  implemented yet. Disabled rather than hidden: the space and width
+                  stay put so nothing in the layout shifts once this is wired up. */}
+              <div className={`px-5 pb-1 ${!['refine', 'plan'].includes(phase) ? 'hidden' : ''}`}>
+                <p className="text-[10px] text-[#5a5f66]">Уточнения в разработке</p>
               </div>
-
-              {/* Compose Chat Input Form */}
               <form
-                className={`compose ${!['refine', 'ready'].includes(phase) ? 'hidden' : ''}`}
+                className={`compose ${!['refine', 'plan'].includes(phase) ? 'hidden' : ''}`}
                 id="compose"
                 onSubmit={(e) => {
                   e.preventDefault();
@@ -1092,72 +1428,77 @@ export default function App() {
               >
                 <input
                   id="inp"
-                  placeholder="Уточните пожелания…"
+                  placeholder="Скоро: правки маршрута текстом"
                   aria-label="Сообщение"
                   value={inputText}
                   onChange={(e) => setInputText(e.target.value)}
+                  disabled
                 />
-                <button type="submit" className="btn btn-y">
+                <button type="submit" className="btn btn-y" disabled>
                   Отправить
                 </button>
               </form>
             </>
-          )}
 
         </div>
 
-        {/* RIGHT VIEWPORT: Google Map component */}
-        <main className="flex-1 h-[42vh] md:h-full relative overflow-hidden" id="right-viewport">
-          <MapComponent
-            activeStopIndex={activeStopIndex}
-            onStopClick={(idx) => handleSelectStop(idx, Math.ceil((idx + 1) / 2))}
-            removedIndices={removedIndices}
-            phase={phase}
-            generationStep={generationStep}
-            routeLine={routeLine}
-            originCoord={originCoord}
-            destCoord={destCoord}
-            onOriginDragEnd={(lat, lng) => handleMarkerDragEnd('origin', lat, lng)}
-            onDestDragEnd={(lat, lng) => handleMarkerDragEnd('dest', lat, lng)}
-            pickingField={pickingField}
-            onMapClick={handleMapClick}
-          />
-        </main>
-
-        {/* Auth Modal overlay block */}
-        <div className={`modal ${showModal ? 'on' : ''}`} id="modal">
-          <div className="modal-box">
-            <h2>Войдите, чтобы построить маршрут</h2>
-            <p>
-              Расчёт использует внешние сервисы. Аккаунт нужен, чтобы сохранить поездку и вернуться к ней. Ответы квиза не потеряются.
-            </p>
-            <button className="auth-btn" onClick={handleAuthConfirm}>
-              Продолжить с Google
-            </button>
-            <button className="auth-btn" onClick={handleAuthConfirm}>
-              Продолжить с Apple
-            </button>
-            <button className="auth-btn alt" onClick={handleAuthConfirm}>
-              Ссылка на email
-            </button>
+        {/* RIGHT VIEWPORT: Google Map component + plan panel */}
+        <main className="flex-1 h-[42vh] md:h-full flex overflow-hidden" id="right-viewport">
+          <div className="relative flex-1 h-full overflow-hidden">
+            <MapComponent
+              phase={phase}
+              generationStep={generationStep}
+              routeLine={routeLine}
+              originCoord={originCoord}
+              destCoord={destCoord}
+              onOriginDragEnd={(lat, lng) => handleMarkerDragEnd('origin', lat, lng)}
+              onDestDragEnd={(lat, lng) => handleMarkerDragEnd('dest', lat, lng)}
+              pickingField={pickingField}
+              onMapClick={handleMapClick}
+              planRouteLines={planRouteLinesForMap}
+              planMarkers={planMarkersForMap}
+              activeDaySegments={activeDaySegments}
+              dayBoundaryMarkers={dayBoundaryMarkersForMap}
+              selectedStopId={selectedStopId}
+              onSelectStop={handleSelectStop}
+              onClosePopup={() => setSelectedStopId(null)}
+              onToggleStop={handleToggleStop}
+            />
           </div>
-        </div>
+
+          {phase === 'plan' && (
+            <PlanPanel
+              options={options}
+              activeOptionIndex={activeOptionIndex}
+              onSelectTab={setActiveOptionIndex}
+              includedByOption={includedByOption}
+              onToggleStop={handleToggleStop}
+              routeThroughByOption={routeThroughByOption}
+              isRecomputing={loadingOptionIndex === activeOptionIndex}
+              selectedStopId={selectedStopId}
+              onSelectStop={handleSelectStop}
+              detailedByOption={detailedByOption}
+              enrichedByOption={enrichedByOption}
+              onFinalizeClick={handleFinalizeClick}
+            />
+          )}
+        </main>
 
         {/* Confirm New Trip Modal */}
         <div className={`modal ${showConfirmNewTrip ? 'on' : ''}`} id="confirm-new-trip">
           <div className="modal-box">
             <h2>Начать новую поездку?</h2>
             <p>
-              У вас есть несохранённые изменения в текущей поездке. Вы уверены, что хотите сбросить её и начать заново? Несохранённые изменения будут утеряны.
+              Текущий черновик сохранён, но списка поездок пока нет — после начала новой поездки вернуться к этой уже не получится. Начать заново?
             </p>
             <div className="flex gap-3 justify-end mt-4">
-              <button 
+              <button
                 className="px-4 py-2 text-xs font-semibold rounded bg-[#3a4048] text-white hover:bg-opacity-80"
                 onClick={() => setShowConfirmNewTrip(false)}
               >
                 Отмена
               </button>
-              <button 
+              <button
                 className="px-4 py-2 text-xs font-semibold rounded bg-[#c05640] text-white hover:bg-opacity-80"
                 onClick={() => {
                   setShowConfirmNewTrip(false);
@@ -1169,6 +1510,40 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        <DateModal
+          isOpen={showDateModal}
+          onCancel={() => setShowDateModal(false)}
+          onConfirm={handleConfirmEnrich}
+        />
+
+        {/* Sign-in modal — shared by PlanPanel's "Финализировать поездку" and
+            the header's "Войти". Closing just hides the overlay; the draft
+            underneath is untouched either way. */}
+        <div className={`modal ${showFinalizeModal ? 'on' : ''}`} id="finalize-modal">
+          <div className="modal-box">
+            <h2>Сохраните и финализируйте поездку</h2>
+            <p>
+              Войдите, чтобы сохранить черновик и получить финальный маршрут. Ваши изменения уже сохранены.
+            </p>
+            <GoogleSignInButton onCredential={handleGoogleCredential} />
+            {authModalError && (
+              <p className="text-[11px] text-[#c05640] text-center mt-2">{authModalError}</p>
+            )}
+            <button className="auth-btn alt mt-2" onClick={() => setShowFinalizeModal(false)}>
+              Закрыть
+            </button>
+          </div>
+        </div>
+
+        <MyTripsModal
+          isOpen={showMyTripsModal}
+          trips={myTrips}
+          isLoading={isMyTripsLoading}
+          onClose={() => setShowMyTripsModal(false)}
+          onOpenTrip={handleOpenTripFromList}
+          onDeleteTrip={handleDeleteTripFromList}
+        />
 
       </div>
     </div>

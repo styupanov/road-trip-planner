@@ -554,6 +554,11 @@ body {
   outline-offset: 1px;
 }
 
+.compose input:disabled {
+  opacity: .4;
+  cursor: default;
+}
+
 .hints {
   padding: 0 20px 11px;
   display: flex;
@@ -710,6 +715,12 @@ body {
   background: none;
   color: var(--sand);
   border: 1px solid var(--asphalt-3);
+}
+
+.auth-btn:disabled,
+.auth-btn:disabled:hover {
+  opacity: .4;
+  cursor: default;
 }
 
 .auth-btn.alt:hover {
