@@ -11,6 +11,14 @@ export interface FinalizeGateModalProps {
   stopCount: number;
   plannedDays: number | null;
   flexibleDays: boolean;
+  // First-ever finalize for this user (from GET /credits, fetched alongside
+  // the balance check that decides paywall vs confirm — see App.tsx's
+  // openFinalizeGate, so this is already known BEFORE the confirm screen
+  // renders, not just after the job completes). The gift framing lives here:
+  // no credit/price language until the welcome modal reveals it, after the
+  // result. Money mechanics are unaffected either way — the welcome credit
+  // is still spent normally on the backend; this only changes what's shown.
+  isFirstFinalize: boolean;
   submitting: boolean;
   error: string | null;
   onConfirm: () => void;
@@ -25,11 +33,20 @@ export const FinalizeGateModal: React.FC<FinalizeGateModalProps> = ({
   stopCount,
   plannedDays,
   flexibleDays,
+  isFirstFinalize,
   submitting,
   error,
   onConfirm,
   onClose,
 }) => {
+  const routeSummary = (
+    <>
+      {originName || '...'} → {destName || '...'} · {stopCount}{' '}
+      {stopCount === 1 ? 'остановка' : stopCount < 5 ? 'остановки' : 'остановок'}
+      {plannedDays != null ? ` · ${plannedDays}${flexibleDays ? ' ±1' : ''} дн.` : ''}
+    </>
+  );
+
   return (
     <div className={`modal ${isOpen ? 'on' : ''}`}>
       <div className="modal-box">
@@ -47,13 +64,31 @@ export const FinalizeGateModal: React.FC<FinalizeGateModalProps> = ({
               Закрыть
             </button>
           </>
+        ) : isFirstFinalize ? (
+          <>
+            <h2>Финализировать поездку</h2>
+            <p>
+              {routeSummary}
+              <br /><br />
+              В финальную версию войдут: точное время маршрута от Google, разбивка по дням,
+              AI-гид по остановкам с учётом дат. Черновик останется доступен — финал не
+              заменяет его, а сохраняется отдельно.
+            </p>
+            {error && (
+              <p className="text-[11px] text-[#c05640] mb-3 -mt-2">{error}</p>
+            )}
+            <button className="auth-btn" onClick={onConfirm} disabled={submitting}>
+              {submitting ? 'Финализируем…' : 'Финализировать'}
+            </button>
+            <button className="auth-btn alt mt-2" onClick={onClose} disabled={submitting}>
+              Отмена
+            </button>
+          </>
         ) : (
           <>
             <h2>Финализировать поездку</h2>
             <p>
-              {originName || '...'} → {destName || '...'} · {stopCount}{' '}
-              {stopCount === 1 ? 'остановка' : stopCount < 5 ? 'остановки' : 'остановок'}
-              {plannedDays != null ? ` · ${plannedDays}${flexibleDays ? ' ±1' : ''} дн.` : ''}
+              {routeSummary}
               <br /><br />
               В финальную версию войдут: точное время маршрута от Google, разбивка по дням,
               AI-гид по остановкам с учётом дат. Финализация использует{' '}

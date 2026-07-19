@@ -1872,6 +1872,7 @@ export default function App() {
           stopCount={(includedByOption.get(activeOptionIndex) ?? new Set<number>()).size}
           plannedDays={typeof answers.days === 'number' ? answers.days : null}
           flexibleDays={!!answers.flexible_days}
+          isFirstFinalize={!!credits?.is_first_finalize}
           submitting={finalizeSubmitting}
           error={finalizeGateError}
           onConfirm={handleConfirmFinalize}
