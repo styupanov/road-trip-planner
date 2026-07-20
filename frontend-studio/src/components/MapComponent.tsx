@@ -21,6 +21,9 @@ interface MapComponentProps {
   // only non-empty once /detail-route has run for it (see App.tsx comment).
   activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string }>;
   dayBoundaryMarkers: Array<{ position: { lat: number; lng: number }; color: string; label: string }>;
+  // Фаза ночёвок: only ever populated in phase 'finalized' (a snapshot's
+  // chosen lodging) — App.tsx passes [] for every other phase.
+  lodgingMarkers: Array<{ position: { lat: number; lng: number }; name: string }>;
   selectedStopId: number | null;
   onSelectStop: (id: number) => void;
   onClosePopup: () => void;
@@ -41,6 +44,7 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   planMarkers,
   activeDaySegments,
   dayBoundaryMarkers,
+  lodgingMarkers,
   selectedStopId,
   onSelectStop,
   onClosePopup,
@@ -67,6 +71,7 @@ export const MapComponent: React.FC<MapComponentProps> = ({
         planMarkers={showOverlay ? planMarkers : []}
         activeDaySegments={showOverlay ? activeDaySegments : []}
         dayBoundaryMarkers={showOverlay ? dayBoundaryMarkers : []}
+        lodgingMarkers={showOverlay ? lodgingMarkers : []}
         selectedStopId={selectedStopId}
         onSelectStop={onSelectStop}
         onClosePopup={onClosePopup}

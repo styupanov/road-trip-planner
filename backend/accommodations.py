@@ -50,7 +50,7 @@ async def find_nearest_lodging(
     собственный контракт этого модуля, не сырой ответ Google:
 
         {place_id, name, lat, lon, rating, user_ratings_total,
-         price_level, vicinity, maps_url}
+         price_level, vicinity, maps_url, distance_m}
 
     Если источник позже сменится (SearchApi/SerpApi с ценами на конкретные
     даты, Booking) — меняется только тело этой функции; форма результата и
@@ -118,6 +118,7 @@ async def find_nearest_lodging(
             "price_level": place.get("price_level"),
             "vicinity": place.get("vicinity"),
             "maps_url": f"https://www.google.com/maps/place/?q=place_id:{place['place_id']}",
+            "distance_m": round(dist),
         }))
 
     scored.sort(key=lambda pair: pair[0])
@@ -125,3 +126,71 @@ async def find_nearest_lodging(
 
     _cache[cache_key] = results
     return results[:limit]
+
+
+# Below this many reviews, a rating is noise, not signal — a single 5-star
+# review reads identically to a genuine 5.0 from hundreds. Tunable; found by
+# a live check_finalize_preview.py run where a place called "Adams
+# Communications Inc" (rating 5.0, 1 review — not a hotel, a Google Places
+# type=lodging misclassification) outranked "Hampton Inn Montrose" (4.4,
+# 587 reviews) under plain rating-descending sort.
+_MIN_RELIABLE_REVIEWS = 10
+
+# How many reliable (see above) candidates must exist before the unreliable
+# ones (thin reviews, no rating at all) get hidden entirely. Below this, the
+# corridor is remote enough (mostly campgrounds, thin-review places) that
+# filtering would leave too few or zero options — showing a low-confidence
+# pick beats showing nothing. Tunable; the low end of "a couple" on purpose,
+# so filtering kicks in as soon as there's more than one place to trust.
+_MIN_RELIABLE_CANDIDATES_TO_FILTER = 2
+
+_TOP_N = 5
+
+
+def _bayes_score(place: dict) -> float:
+    """rating * ln(reviews + 1) — a handful of 5-star reviews score below a
+    well-reviewed 4.4, unlike raw rating. +1 keeps ln defined at 0 reviews
+    (score 0 either way, since an unrated/review-less place never reaches
+    this function with a real rating attached)."""
+    rating = place.get("rating") or 0
+    reviews = place.get("user_ratings_total") or 0
+    return rating * math.log(reviews + 1)
+
+
+def rank_for_selection(lodging: list[dict]) -> list[dict]:
+    """Re-ranks find_nearest_lodging's output for showing the user a top-5
+    pick, in two stages:
+
+    1. Quality filter: split into "reliable" (has a rating AND at least
+       _MIN_RELIABLE_REVIEWS reviews) and everything else. If there are at
+       least _MIN_RELIABLE_CANDIDATES_TO_FILTER reliable places, show ONLY
+       those — this is what drops Places' type=lodging misclassifications
+       (offices, trail-ride outfitters, anything with a thin or absent
+       review history that snuck in under the same type). A user must never
+       see an office listed as a place to sleep.
+
+    2. Remote-corridor fallback: if reliable places don't clear that bar
+       (a genuinely remote stretch — campgrounds and thin-review places are
+       ALL there is), the filter lifts entirely rather than returning an
+       empty list. A campground with two reviews can be the only real
+       option out there; showing nothing would be worse than showing a
+       low-confidence pick. Rated entries (however thin) sorted by Bayes
+       score first, unrated last in find_nearest_lodging's own distance
+       order (nearest unrated first).
+
+    Either stage sorts by _bayes_score, never raw rating — see its own
+    docstring for why (the exact failure this whole function exists to fix).
+    """
+    reliable = [
+        p for p in lodging
+        if p.get("rating") is not None and (p.get("user_ratings_total") or 0) >= _MIN_RELIABLE_REVIEWS
+    ]
+
+    if len(reliable) >= _MIN_RELIABLE_CANDIDATES_TO_FILTER:
+        reliable.sort(key=_bayes_score, reverse=True)
+        return reliable[:_TOP_N]
+
+    rated = [p for p in lodging if p.get("rating") is not None]
+    unrated = [p for p in lodging if p.get("rating") is None]
+    rated.sort(key=_bayes_score, reverse=True)
+    return (rated + unrated)[:_TOP_N]

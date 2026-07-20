@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import accommodations
 import db
 import directions
 import enrichment
@@ -109,6 +110,36 @@ async def _make_trip_with_draft(conn, user_id: uuid.UUID) -> uuid.UUID:
         user_id, json.dumps(quiz_answers), json.dumps(draft_state),
     )
     return row["id"]
+
+
+def _fake_trip(draft_state: dict, quiz_answers: dict) -> dict:
+    """In-memory trip dict, no DB — build_finalize_preview only reads its
+    argument, never touches the database itself, so preview tests don't need
+    the cleanup fixture or a real trip_projects row at all."""
+    return {
+        "id": uuid.uuid4(),
+        "origin_name": "Денвер",
+        "destination_name": "Дуранго",
+        "quiz_answers": quiz_answers,
+        "draft_state": draft_state,
+    }
+
+
+def _draft_state_with_stops(stops: list[dict], included_ids: list[int]) -> dict:
+    return {
+        "version": 1,
+        "options": [{
+            "index": 0, "duration_s": 30000, "distance_km": 400.0,
+            "route_shape": "fake_shape", "through_shape": None, "total_s": None, "delta_s": None,
+            "stops": stops, "candidates_found": len(stops), "avg_rating": None,
+            "top_stops": [], "near_endpoints": [], "unreachable": [],
+        }],
+        "activeOptionIndex": 0,
+        "includedByOption": [[0, included_ids]],
+        "routeThroughByOption": [],
+        "routeOrigin": {"lat": 39.7392, "lng": -104.9903},
+        "routeDest": {"lat": 37.2753, "lng": -107.8801},
+    }
 
 
 _FAKE_ROUTE_DETAIL = {
@@ -375,7 +406,11 @@ async def test_process_finalization_completes_with_real_pipeline(cleanup):
             "shape": "fake_google_shape",
             "legs": _FAKE_ROUTE_DETAIL["legs"],
         }
-        assert snapshot["days"] == _FAKE_ROUTE_DETAIL["days"]
+        # No selected_lodging was passed to process_finalization -> every day
+        # carries lodging=None, not just an absent key (uniform shape, see
+        # finalize.py's snapshot_days comment).
+        expected_days = [{**d, "lodging": None} for d in _FAKE_ROUTE_DETAIL["days"]]
+        assert snapshot["days"] == expected_days
         assert snapshot["enrichment"] == {
             "overview": _FAKE_ENRICH_RESULT["overview"],
             "warnings": _FAKE_ENRICH_RESULT["warnings"],
@@ -461,3 +496,193 @@ async def test_process_finalization_refunds_when_enrichment_fails(cleanup):
 
         project_status = await conn.fetchval("SELECT status FROM app.trip_projects WHERE id = $1", trip_id)
         assert project_status == "draft"
+
+
+# --- Фаза ночёвок, подшаг 1: free preview (no DB, no credit) -----------------
+# build_finalize_preview only reads the trip dict it's given — no cleanup
+# fixture needed, nothing touches the database.
+
+async def test_build_finalize_preview_ranks_lodging_and_marks_selection_needed():
+    stop1 = _fake_stop(1, to_poi_s=1000)
+    stop2 = _fake_stop(2, to_poi_s=2000)
+    trip = _fake_trip(
+        _draft_state_with_stops([stop1, stop2], included_ids=[1, 2]),
+        quiz_answers={"drive": "до 4 ч", "detour": "до 30 мин"},
+    )
+
+    # Two stops, daily_limit_s=14400 (see quizMapping's "до 4 ч"): leg0+leg1
+    # alone would push day 1 over the limit if stop2 were added to it, so
+    # day_split must split after stop1 -> two days, exactly the boundary
+    # this test needs to exercise lodging insertion at.
+    fake_through = {
+        "legs": [
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 5000, "distance_km": 20.0},
+        ],
+        "total_s": 25000, "distance_km": 120.0, "route_shape": "valhalla_shape",
+    }
+    unrated = {"place_id": "p_unrated", "name": "Unrated Camp", "lat": 0, "lon": 0,
+               "rating": None, "user_ratings_total": None, "price_level": None,
+               "vicinity": "middle of nowhere", "maps_url": "url_unrated", "distance_m": 500}
+    low_rated = {"place_id": "p_low", "name": "Low Rated Inn", "lat": 0, "lon": 0,
+                 "rating": 3.2, "user_ratings_total": 10, "price_level": 1,
+                 "vicinity": "town", "maps_url": "url_low", "distance_m": 1000}
+    high_rated = {"place_id": "p_high", "name": "High Rated Lodge", "lat": 0, "lon": 0,
+                  "rating": 4.8, "user_ratings_total": 300, "price_level": 3,
+                  "vicinity": "town center", "maps_url": "url_high", "distance_m": 2000}
+
+    with patch("services.stops.build_route_through", new=AsyncMock(return_value=fake_through)), \
+         patch("accommodations.find_nearest_lodging", new=AsyncMock(return_value=[unrated, low_rated, high_rated])) as mock_lodging:
+        preview = await finalize.build_finalize_preview(trip)
+
+    assert preview["preliminary"] is True
+    assert len(preview["days"]) == 2
+
+    day1 = preview["days"][0]
+    assert day1["stop_indices"] == [0]
+    assert day1["end_point"] == {"lat": stop1["lat"], "lon": stop1["lon"], "near_stop_name": "Stop 1"}
+    # Two reliable (>=10 reviews) candidates exist (low_rated, high_rated) ->
+    # rank_for_selection's quality filter kicks in and drops the unrated one
+    # entirely, ordering the rest by Bayes score, not raw rating. Ranking
+    # edge cases themselves are covered exhaustively in test_accommodations.py
+    # — this just confirms build_finalize_preview wires rank_for_selection in.
+    assert [o["place_id"] for o in day1["lodging_options"]] == ["p_high", "p_low"]
+
+    day2 = preview["days"][1]
+    assert day2["stop_indices"] == [1]
+    assert day2["end_point"] == {"lat": 37.2753, "lon": -107.8801, "near_stop_name": None}
+    # Last day never gets a lodging search — no night follows it.
+    assert day2["lodging_options"] == []
+
+    assert preview["has_lodging"] is True
+    assert preview["needs_selection"] is True
+
+    # Radius comes from the quiz's "detour" answer (до 30 мин = 1800s),
+    # converted at 1000/60 m per second -> 30000m; limit=20 candidates
+    # fetched so ranking has enough to work with before slicing to 5.
+    mock_lodging.assert_called_once_with(stop1["lat"], stop1["lon"], 30000, limit=20)
+
+
+async def test_build_finalize_preview_single_day_skips_lodging_search():
+    stop1 = _fake_stop(1, to_poi_s=1000)
+    trip = _fake_trip(
+        _draft_state_with_stops([stop1], included_ids=[1]),
+        quiz_answers={"drive": "до 4 ч"},
+    )
+    fake_through = {
+        "legs": [
+            {"duration_s": 5000, "distance_km": 30.0},
+            {"duration_s": 3000, "distance_km": 15.0},
+        ],
+        "total_s": 8000, "distance_km": 45.0, "route_shape": "valhalla_shape",
+    }
+
+    with patch("services.stops.build_route_through", new=AsyncMock(return_value=fake_through)), \
+         patch("accommodations.find_nearest_lodging", new=AsyncMock()) as mock_lodging:
+        preview = await finalize.build_finalize_preview(trip)
+
+    assert len(preview["days"]) == 1
+    assert preview["days"][0]["lodging_options"] == []
+    assert preview["has_lodging"] is False
+    assert preview["needs_selection"] is False
+    mock_lodging.assert_not_called()
+
+
+# --- Фаза ночёвок, подшаг 3: paid finalize with a lodging selection ---------
+
+async def test_process_finalization_with_selected_lodging_inserts_waypoints(cleanup):
+    """selected_lodging=[{day:1,...}] must land as a waypoint between day 1's
+    stop and day 2's stop, with FIXED day boundaries (not re-discovered by
+    day_split against the final Google times) and the snapshot's day 1
+    carrying the chosen lodging, day 2 carrying None (last day, never picked)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        trip_id = await _make_trip_with_draft(conn, user_id)
+    cleanup["users"].append(user_id)
+    cleanup["trip_projects"].append(trip_id)
+
+    # _make_trip_with_draft's stops are ids 1 (to_poi_s=3600) and 2
+    # (to_poi_s=1800), both included -> sorted order is [2, 1]. Reuse it
+    # rather than a third draft-building helper; day_split below only cares
+    # about stop_count (2) and leg times, not which real stop is which.
+    fake_through = {
+        "legs": [
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 5000, "distance_km": 20.0},
+        ],
+        "total_s": 25000, "distance_km": 120.0, "route_shape": "valhalla_shape",
+    }
+    fake_google_result = {
+        "duration_s": 14000, "distance_km": 100.0, "shape": "google_shape_with_lodging",
+        "legs": [
+            {"duration_s": 2000, "distance_km": 10.0},
+            {"duration_s": 3000, "distance_km": 15.0},
+            {"duration_s": 4000, "distance_km": 20.0},
+            {"duration_s": 5000, "distance_km": 25.0},
+        ],
+    }
+    fake_baseline = {"duration_s": 12000, "distance_km": 90.0, "shape": "baseline_shape", "legs": []}
+
+    calls: list[list] = []
+
+    async def fake_get_directions(origin, destination, waypoints=None):
+        calls.append(waypoints)
+        return fake_google_result if waypoints else fake_baseline
+
+    selected_lodging = [{
+        "day": 1, "place_id": "lodge123", "lat": 39.15, "lon": -105.15, "name": "Mountain Inn",
+        "rating": 4.6, "vicinity": "123 Alpine Way, Ouray",
+    }]
+
+    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+
+    with patch("services.stops.build_route_through", new=AsyncMock(return_value=fake_through)), \
+         patch("directions.get_directions", new=AsyncMock(side_effect=fake_get_directions)), \
+         patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
+        await finalize.process_finalization(job.id, selected_lodging)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        job_row = await conn.fetchrow(
+            "SELECT status, trip_version_id FROM app.finalization_jobs WHERE id = $1", job.id
+        )
+        assert job_row["status"] == "done"
+
+        version_row = await conn.fetchrow(
+            "SELECT snapshot FROM app.trip_versions WHERE id = $1", job_row["trip_version_id"]
+        )
+        snapshot = json.loads(version_row["snapshot"])
+
+    # Lodging coordinate inserted as the middle waypoint, between the two stops.
+    routed_waypoints = calls[0]
+    assert routed_waypoints[1] == (39.15, -105.15)
+    assert len(routed_waypoints) == 3
+
+    assert snapshot["route"]["shape"] == "google_shape_with_lodging"
+    assert len(snapshot["days"]) == 2
+
+    day1, day2 = snapshot["days"]
+    assert day1["stop_indices"] == [0]
+    assert day1["drive_s"] == 5000  # legs[0]+legs[1] = 2000+3000
+    assert day1["total_s"] == 8600  # + visit_s 3600
+    assert day1["lodging"] == {
+        "place_id": "lodge123", "name": "Mountain Inn", "lat": 39.15, "lon": -105.15,
+        "maps_url": "https://www.google.com/maps/place/?q=place_id:lodge123",
+        "rating": 4.6, "vicinity": "123 Alpine Way, Ouray",
+    }
+
+    assert day2["stop_indices"] == [1]
+    assert day2["drive_s"] == 9000  # legs[2]+legs[3] = 4000+5000 (final leg to dest included)
+    assert day2["total_s"] == 12600
+    assert day2["lodging"] is None
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Money mechanics unaffected — one credit spent, nothing extra.
+        balance = await conn.fetchval("SELECT balance FROM app.credit_accounts WHERE user_id = $1", user_id)
+        assert balance == 0
+        project_status = await conn.fetchval("SELECT status FROM app.trip_projects WHERE id = $1", trip_id)
+        assert project_status == "finalized"

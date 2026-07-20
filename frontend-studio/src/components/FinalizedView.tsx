@@ -1,8 +1,9 @@
 import React from 'react';
-import { Info, Calendar, CheckCircle2 } from 'lucide-react';
-import { FinalizedStop, FinalizedTripResult } from '../api';
+import { Info, Calendar, CheckCircle2, BedDouble, ExternalLink, Navigation } from 'lucide-react';
+import { FinalizedLodging, FinalizedStop, FinalizedTripResult } from '../api';
 import { formatDuration, formatDaysRu } from '../format';
 import { dayColor } from '../dayColors';
+import { buildGoogleMapsDayUrl } from '../googleMapsExport';
 
 export interface FinalizedViewProps {
   trip: FinalizedTripResult;
@@ -68,6 +69,23 @@ const FinalizedStopCard: React.FC<{
   </div>
 );
 
+const LodgingLine: React.FC<{ lodging: FinalizedLodging }> = ({ lodging }) => (
+  <a
+    href={lodging.maps_url}
+    target="_blank"
+    rel="noopener noreferrer"
+    className="flex items-center gap-1.5 px-2.5 py-2 mt-1.5 rounded bg-[#16a085]/10 border border-[#16a085]/25 hover:bg-[#16a085]/15 transition-colors"
+  >
+    <BedDouble size={13} className="text-[#16a085] flex-shrink-0" />
+    <span className="text-[12px] text-[#c7cdd4] leading-snug min-w-0 truncate">
+      Ночёвка: <span className="text-[#f2ede3] font-medium">{lodging.name}</span>
+      {lodging.vicinity && ` — ${lodging.vicinity}`}
+      {lodging.rating != null && ` ★${lodging.rating.toFixed(1)}`}
+    </span>
+    <ExternalLink size={11} className="text-[#6a9fd8] flex-shrink-0 ml-auto" />
+  </a>
+);
+
 const formatFinalizedAt = (iso: string): string => {
   try {
     return new Date(iso).toLocaleDateString('ru-RU', {
@@ -119,11 +137,15 @@ export const FinalizedView: React.FC<FinalizedViewProps> = ({ trip, selectedStop
           </div>
         )}
 
-        {trip.days.map((day) => {
+        {trip.days.map((day, dayIdx) => {
           const dayStops = day.stop_indices
             .map((idx) => trip.stops[idx])
             .filter((s): s is FinalizedStop => s != null);
           const lastStopName = dayStops.length > 0 ? dayStops[dayStops.length - 1].name : null;
+          const prevDayLodging = dayIdx > 0 ? trip.days[dayIdx - 1].lodging : null;
+          const mapsUrl = buildGoogleMapsDayUrl(
+            day, dayStops, prevDayLodging, { lat: trip.origin.lat, lon: trip.origin.lon }
+          );
 
           return (
             <div key={day.day}>
@@ -155,6 +177,18 @@ export const FinalizedView: React.FC<FinalizedViewProps> = ({ trip, selectedStop
                   />
                 ))}
               </div>
+              {day.lodging && <LodgingLine lodging={day.lodging} />}
+              {mapsUrl && (
+                <a
+                  href={mapsUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 mt-1.5 rounded text-[11px] font-medium text-[#8b9199] border border-[#2c3138] hover:border-[#3a4048] hover:text-[#f2ede3] transition-colors"
+                >
+                  <Navigation size={12} className="flex-shrink-0" />
+                  Открыть день в Google Maps
+                </a>
+              )}
             </div>
           );
         })}

@@ -616,6 +616,82 @@ export async function getCredits(): Promise<CreditsResult> {
   return res.json();
 }
 
+export interface DayEndPoint {
+  lat: number;
+  lon: number;
+  near_stop_name: string | null;
+}
+
+export interface LodgingOption {
+  place_id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  rating: number | null;
+  user_ratings_total: number | null;
+  price_level: number | null;
+  vicinity: string | null;
+  maps_url: string;
+  distance_m: number;
+}
+
+export interface PreviewDay {
+  day: number;
+  stop_indices: number[];
+  drive_s: number;
+  visit_s: number;
+  total_s: number;
+  over_limit: boolean;
+  end_point: DayEndPoint;
+  // Up to 5, ranked (see accommodations.rank_for_selection on the backend) —
+  // always [] for the last day (no night follows it) and may be [] for an
+  // earlier day too if nothing real was found nearby.
+  lodging_options: LodgingOption[];
+}
+
+export interface FinalizePreviewResult {
+  // Always true — these are Valhalla-estimated days, not yet Google's exact
+  // ones (see PlanPanel's "(оценка)" labeling elsewhere). The paid finalize
+  // step recomputes days on exact times; they can end up slightly different.
+  preliminary: boolean;
+  days: PreviewDay[];
+  has_lodging: boolean;
+  // >1 day and at least one night has a real option — App.tsx uses this to
+  // decide whether to show the lodging picker at all or skip straight to
+  // the paywall/confirm step.
+  needs_selection: boolean;
+}
+
+// Free — never charges a credit. Called right after the auth gate, BEFORE
+// the paywall/confirm screen, so the user sees the day split and lodging
+// options before any credit is at stake.
+export async function postFinalizePreview(tripId: string): Promise<FinalizePreviewResult> {
+  const res = await fetch(`${API_URL}/trips/${tripId}/finalize-preview`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Finalize preview request failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
+export interface SelectedLodging {
+  day: number;
+  place_id: string;
+  lat: number;
+  lon: number;
+  name: string;
+  // Carried straight from the LodgingOption the user picked (already have
+  // it from finalize-preview) so the finalized snapshot can show them
+  // without needing to re-fetch from Places.
+  rating: number | null;
+  vicinity: string | null;
+}
+
 export interface FinalizeResult {
   job_id: string;
   status: string;
@@ -627,13 +703,17 @@ export interface FinalizeResult {
 // not per click/retry — the backend's start_finalization treats a replayed
 // key as "return the existing job", so retrying a failed request with the
 // SAME key is exactly the safe behavior a flaky network needs, never a
-// double charge.
-export async function postFinalizeTrip(tripId: string, idempotencyKey: string): Promise<FinalizeResult> {
+// double charge. selectedLodging is null when the user skipped the picker
+// (or it was never shown, e.g. a 1-day trip) — the route then has no
+// lodging waypoints at all, same as before this feature existed.
+export async function postFinalizeTrip(
+  tripId: string, idempotencyKey: string, selectedLodging: SelectedLodging[] | null
+): Promise<FinalizeResult> {
   const res = await fetch(`${API_URL}/trips/${tripId}/finalize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
     credentials: 'include',
-    body: JSON.stringify({}),
+    body: JSON.stringify({ selected_lodging: selectedLodging }),
   });
 
   if (!res.ok) {
@@ -698,12 +778,29 @@ export interface FinalizedEnrichment {
   sources: EnrichSource[];
 }
 
+export interface FinalizedLodging {
+  place_id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  maps_url: string;
+  rating: number | null;
+  vicinity: string | null;
+}
+
+// Own shape rather than reusing DayResult (which the free draft's day
+// grouping also uses) — a finalized day always carries a lodging field
+// (an object or null), a concept the free draft never has.
+export interface FinalizedDay extends DayResult {
+  lodging: FinalizedLodging | null;
+}
+
 export interface FinalizedTripResult {
   origin: FinalizedEndpoint;
   destination: FinalizedEndpoint;
   stops: FinalizedStop[];
   route: FinalizedRoute;
-  days: DayResult[];
+  days: FinalizedDay[];
   enrichment: FinalizedEnrichment;
   trip_dates: string | null;
   finalized_at: string;

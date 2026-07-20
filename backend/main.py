@@ -271,10 +271,90 @@ async def delete_trip_endpoint(trip_id: uuid.UUID, session: sessions.Session = D
     return {"status": "ok"}
 
 
+class LodgingOptionOut(BaseModel):
+    place_id: str
+    name: str
+    lat: float
+    lon: float
+    rating: float | None
+    user_ratings_total: int | None
+    price_level: int | None
+    vicinity: str | None
+    maps_url: str
+    distance_m: int
+
+
+class DayEndPointOut(BaseModel):
+    lat: float
+    lon: float
+    near_stop_name: str | None
+
+
+class PreviewDayOut(BaseModel):
+    day: int
+    stop_indices: list[int]
+    drive_s: int
+    visit_s: int
+    total_s: int
+    over_limit: bool
+    end_point: DayEndPointOut
+    lodging_options: list[LodgingOptionOut]
+
+
+class FinalizePreviewResponse(BaseModel):
+    preliminary: bool
+    days: list[PreviewDayOut]
+    has_lodging: bool
+    needs_selection: bool
+
+
+# Фаза ночёвок, подшаг 1: free preview — Valhalla-estimated day split (same
+# precision as the free draft, never Google) plus lodging options at each
+# night's end, BEFORE any credit is spent. Ownership-checked like get_trip,
+# but requires a real account (same reasoning as /trips list — an anonymous
+# session has no "finalize" concept to preview towards).
+@app.post("/trips/{trip_id}/finalize-preview", response_model=FinalizePreviewResponse)
+async def finalize_preview(trip_id: uuid.UUID, session: sessions.Session = Depends(sessions.get_session)):
+    if session.user_id is None:
+        raise HTTPException(status_code=401, detail="Требуется вход.")
+    trip = await trips.get_trip_for_session(session.id, session.user_id, trip_id)
+    if trip is None:
+        raise HTTPException(status_code=404, detail="Проект не найден.")
+
+    try:
+        return await finalize.build_finalize_preview(trip)
+    except finalize.SnapshotBuildError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Valhalla routing error: {e.response.text}")
+    except httpx.RequestError:
+        raise HTTPException(status_code=503, detail="Valhalla routing service unavailable")
+
+
+class SelectedLodgingIn(BaseModel):
+    day: int
+    place_id: str
+    lat: float
+    lon: float
+    name: str
+    # Carried straight from the free preview's LodgingOptionOut (the frontend
+    # already has these — no reason to re-fetch from Places) purely so the
+    # finalized snapshot can display them without ever reading draft_state.
+    # Optional: a skipped/omitted selection (or an older client) still works,
+    # just without these two in the snapshot's lodging block.
+    rating: float | None = None
+    vicinity: str | None = None
+
+
 class FinalizeRequest(BaseModel):
     # Frontend can send the key either as this field or as the Idempotency-Key
     # header (checked first below) — either is fine, one is required.
     idempotency_key: str | None = None
+    # From finalize-preview's picker — one entry per night the user chose
+    # lodging for (day numbers may skip nights they left unpicked). None (or
+    # an empty list) means no lodging at all: the route stays origin ->
+    # stops -> destination exactly as before Фаза ночёвок existed.
+    selected_lodging: list[SelectedLodgingIn] | None = None
 
 
 class FinalizeResponse(BaseModel):
@@ -285,9 +365,11 @@ class FinalizeResponse(BaseModel):
 
 
 # Фаза 3, подшаг 1: charges 1 Trip Credit and starts a finalization_jobs row
-# — see finalize.py's docstrings for the transaction/locking reasoning.
-# process_finalization is a STUB right now (finalize.py's _build_stub_snapshot)
-# — real detail-route/enrich-route/day_split wiring is подшаг 2, not this one.
+# — see finalize.py's docstrings for the transaction/locking reasoning. That
+# charge/lock/idempotency mechanics are UNCHANGED by Фаза ночёвок — only the
+# MOMENT this endpoint is called moved later in the user's flow (after the
+# free preview + lodging pick), and the request now optionally carries
+# selected_lodging through to the background job.
 @app.post("/trips/{trip_id}/finalize", response_model=FinalizeResponse)
 async def finalize_trip(
     trip_id: uuid.UUID,
@@ -319,9 +401,13 @@ async def finalize_trip(
 
     # Only schedule the background run for a job THIS call actually created —
     # scheduling it for a job returned via the idempotency/in-flight paths
-    # would double-process it (see FinalizationJob.is_new's docstring).
+    # would double-process it (see FinalizationJob.is_new's docstring). Same
+    # reasoning now covers selected_lodging too: it's only ever read from
+    # the request that actually created the job (see process_finalization's
+    # own docstring).
     if job.is_new:
-        background_tasks.add_task(finalize.process_finalization, job.id)
+        selected_lodging = [s.model_dump() for s in req.selected_lodging] if req.selected_lodging else None
+        background_tasks.add_task(finalize.process_finalization, job.id, selected_lodging)
 
     return FinalizeResponse(job_id=job.id, status=job.status, trip_version_id=job.trip_version_id, error=job.error)
 
@@ -642,12 +728,35 @@ class FinalizedEnrichmentOut(BaseModel):
     sources: list[SourceOut]
 
 
+class FinalizedLodgingOut(BaseModel):
+    place_id: str
+    name: str
+    lat: float
+    lon: float
+    maps_url: str
+    rating: float | None
+    vicinity: str | None
+
+
+# Own shape rather than reusing DayOut (which /detail-route's free, lodging-
+# unaware response also uses) — every finalized day always carries a
+# lodging field (dict or None), a concept that response never needs.
+class FinalizedDayOut(BaseModel):
+    day: int
+    stop_indices: list[int]
+    drive_s: int
+    visit_s: int
+    total_s: int
+    over_limit: bool
+    lodging: FinalizedLodgingOut | None
+
+
 class FinalizedTripOut(BaseModel):
     origin: FinalizedEndpointOut
     destination: FinalizedEndpointOut
     stops: list[FinalizedStopOut]
     route: FinalizedRouteOut
-    days: list[DayOut]
+    days: list[FinalizedDayOut]
     enrichment: FinalizedEnrichmentOut
     trip_dates: str | None
     finalized_at: str

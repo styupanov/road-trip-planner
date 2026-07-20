@@ -44,6 +44,10 @@ export interface TripMapProps {
   activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string }>;
   // Small colored badges at each point where the route's day color changes.
   dayBoundaryMarkers: Array<{ position: { lat: number; lng: number }; color: string; label: string }>;
+  // Фаза ночёвок: one marker per day that has a chosen overnight — only ever
+  // non-empty in phase 'finalized' (a snapshot's picked lodging), never in
+  // 'plan' (nothing is chosen yet during the free draft).
+  lodgingMarkers: Array<{ position: { lat: number; lng: number }; name: string }>;
   selectedStopId: number | null;
   onSelectStop: (id: number) => void;
   // Closes whatever popup is open — plain map click or a different marker click.
@@ -314,6 +318,7 @@ export const TripMap: React.FC<TripMapProps> = ({
   planMarkers,
   activeDaySegments,
   dayBoundaryMarkers,
+  lodgingMarkers,
   selectedStopId,
   onSelectStop,
   onClosePopup,
@@ -505,6 +510,35 @@ export const TripMap: React.FC<TripMapProps> = ({
             </AdvancedMarker>
           ))}
 
+          {/* Lodging markers (Фаза ночёвок): a distinct bed icon + color, never
+              confused with a yellow stop marker or a day-boundary badge. */}
+          {lodgingMarkers.map((marker, idx) => (
+            <AdvancedMarker
+              key={`lodging-${idx}`}
+              position={marker.position}
+              title={marker.name}
+              zIndex={6}
+            >
+              <div
+                style={{
+                  width: '24px',
+                  height: '24px',
+                  borderRadius: '6px',
+                  backgroundColor: '#16a085',
+                  border: '2px solid #14171a',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: '13px',
+                  lineHeight: 1,
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.5)',
+                }}
+              >
+                🛏
+              </div>
+            </AdvancedMarker>
+          ))}
+
           {/* Popup for the selected stop — only one open at a time, closed by a plain
               map click or by selecting a different marker (both just change/clear
               selectedStopId, which this is keyed off of). */}
@@ -566,6 +600,9 @@ export const TripMap: React.FC<TripMapProps> = ({
             <div><i style={{ background: ROUTE_COLOR, opacity: 0.35 }}></i>другие варианты</div>
           )}
           <div><i style={{ background: '#e8b53f' }}></i>остановка</div>
+          {lodgingMarkers.length > 0 && (
+            <div><i style={{ background: '#16a085' }}></i>ночёвка</div>
+          )}
         </div>
       </div>
     </APIProvider>

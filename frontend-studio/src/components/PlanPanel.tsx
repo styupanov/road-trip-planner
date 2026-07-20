@@ -39,6 +39,10 @@ export interface PlanPanelProps {
   detailedByOption: Map<number, DetailRouteResult>;
   enrichedByOption: Map<number, EnrichRouteResult>;
   onFinalizeClick: () => void;
+  // Фаза ночёвок: the free finalize-preview call is in flight (between the
+  // click and the lodging picker/paywall showing up) — disables the button
+  // and swaps its label so a slow response doesn't read as a dead click.
+  finalizePreviewLoading: boolean;
 }
 
 const PlanStopRow: React.FC<{
@@ -173,6 +177,7 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({
   detailedByOption,
   enrichedByOption,
   onFinalizeClick,
+  finalizePreviewLoading,
 }) => {
   const active = options[activeOptionIndex];
 
@@ -413,9 +418,10 @@ export const PlanPanel: React.FC<PlanPanelProps> = ({
       <div className="p-2.5 border-t border-black flex-shrink-0">
         <button
           onClick={onFinalizeClick}
-          className="w-full px-3 py-3 rounded text-[13px] font-semibold bg-[#e8b53f] text-[#14171a] hover:bg-[#d4a230] transition-colors cursor-pointer"
+          disabled={finalizePreviewLoading}
+          className="w-full px-3 py-3 rounded text-[13px] font-semibold bg-[#e8b53f] text-[#14171a] hover:bg-[#d4a230] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-default"
         >
-          Финализировать поездку
+          {finalizePreviewLoading ? 'Готовим варианты…' : 'Финализировать поездку'}
         </button>
         <p className="text-[10px] text-[#8b9199] leading-snug mt-1.5 text-center">
           Точное время маршрута от Google, разбивка по дням, AI-гид по остановкам и датам, финальное сохранение поездки.

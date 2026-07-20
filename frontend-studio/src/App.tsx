@@ -9,10 +9,10 @@ import { MyTripsModal } from './components/MyTripsModal';
 import {
   getCompareRoutes, postRouteThrough, postDetailRoute, postEnrichRoute, getWhoAmI,
   saveTrip, getCurrentTrip, getMyTrips, getTrip, deleteTrip, loginWithGoogle, getMe, logout,
-  getCredits, postFinalizeTrip, getFinalizeStatus, getFinalizedTrip,
+  getCredits, postFinalizePreview, postFinalizeTrip, getFinalizeStatus, getFinalizedTrip,
   decodeShape, decodeGoogleShape, geocode, reverseGeocode,
   ApiStop, RouteOption, DetailRouteResult, EnrichRouteResult, TripProject, TripSummary,
-  CreditsResult, FinalizedTripResult,
+  CreditsResult, FinalizedTripResult, FinalizePreviewResult, SelectedLodging,
 } from './api';
 import { mapDetourToMaxDetourS, mapDriveToDailyLimitS, mapInterestsToCategories, mapPaceToApiPace } from './quizMapping';
 import { dayColor } from './dayColors';
@@ -23,6 +23,7 @@ import { FinalizeGateModal } from './components/FinalizeGateModal';
 import { FinalizeProgress } from './components/FinalizeProgress';
 import { FinalizedView } from './components/FinalizedView';
 import { WelcomeModal } from './components/WelcomeModal';
+import { LodgingSelectionModal } from './components/LodgingSelectionModal';
 
 // Default/fallback coordinates, used for route building if geocoding never resolves.
 // Must stay within Colorado — Valhalla's tiles only cover this state.
@@ -179,6 +180,19 @@ export default function App() {
   const [finalizedTrip, setFinalizedTrip] = useState<FinalizedTripResult | null>(null);
   const [credits, setCredits] = useState<CreditsResult | null>(null);
   const [showWelcomeModal, setShowWelcomeModal] = useState<boolean>(false);
+
+  // Ночёвки: free finalize-preview result, shown between the Finalize click
+  // and the paywall/confirm step (never charges a credit) — see
+  // startFinalizePreview. The lodging picker only opens when
+  // finalizePreview.needs_selection is true; otherwise this flows straight
+  // into openFinalizeGate with selectedLodging left null.
+  const [finalizePreview, setFinalizePreview] = useState<FinalizePreviewResult | null>(null);
+  const [finalizePreviewLoading, setFinalizePreviewLoading] = useState<boolean>(false);
+  const [showLodgingModal, setShowLodgingModal] = useState<boolean>(false);
+  // The user's choice for THIS finalize attempt — deliberately not part of
+  // draft_state/buildDraftPayload: it's spent the moment finalize succeeds
+  // or fails, never something to restore into a later session.
+  const [selectedLodging, setSelectedLodging] = useState<SelectedLodging[] | null>(null);
 
   // Auth state (Фаза 2) — who the CURRENT session is linked to, if anyone.
   // Fetched once on mount via getMe(); updated in place by
@@ -614,8 +628,9 @@ export default function App() {
   };
 
   // Step 1 of Finalize: not authenticated -> sign-in modal, remembering to
-  // resume straight into the balance check once login succeeds. Already
-  // authenticated -> skip straight to that check.
+  // resume straight into the free preview once login succeeds. Already
+  // authenticated -> skip straight to that preview (see startFinalizePreview
+  // — the balance check moved AFTER the lodging picker, not before it).
   const handleFinalizeClick = () => {
     setAuthModalError(null);
     if (!authState.authenticated) {
@@ -623,7 +638,62 @@ export default function App() {
       setShowFinalizeModal(true);
       return;
     }
+    startFinalizePreview();
+  };
+
+  // Step 1 (continued): free, never charges a credit. Saves the draft first
+  // (same "give finalize-preview the latest checkboxes" reasoning as
+  // handleConfirmFinalize below) so the preview's day split reflects
+  // whatever's actually included right now, not a stale autosave.
+  const startFinalizePreview = () => {
+    if (!tripProjectId) return;
+    setFinalizePreviewLoading(true);
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
+
+    saveDraftNow()
+      .then(() => postFinalizePreview(tripProjectId))
+      .then(preview => {
+        setFinalizePreviewLoading(false);
+        setFinalizePreview(preview);
+        if (preview.needs_selection) {
+          setShowLodgingModal(true);
+        } else {
+          setSelectedLodging(null);
+          openFinalizeGate();
+        }
+      })
+      .catch(err => {
+        console.error('Failed to fetch finalize preview:', err);
+        setFinalizePreviewLoading(false);
+        setMessages(prev => [...prev, {
+          id: `finalize-preview-error-${Date.now()}`,
+          sender: 'bot',
+          text: 'Не удалось подготовить финализацию. Попробуйте ещё раз.',
+        }]);
+      });
+  };
+
+  const handleLodgingContinue = (chosen: SelectedLodging[]) => {
+    setSelectedLodging(chosen);
+    setShowLodgingModal(false);
     openFinalizeGate();
+  };
+
+  const handleLodgingSkip = () => {
+    setSelectedLodging(null);
+    setShowLodgingModal(false);
+    openFinalizeGate();
+  };
+
+  // Closes the picker without proceeding to payment at all — a full cancel
+  // of this Finalize attempt, distinct from "Пропустить" (which still heads
+  // to the paywall/confirm step, just without lodging waypoints).
+  const handleLodgingCancel = () => {
+    setShowLodgingModal(false);
+    setFinalizePreview(null);
   };
 
   const handleLoginClick = () => {
@@ -647,7 +717,7 @@ export default function App() {
         setAuthModalError(null);
         if (pendingAuthAction === 'finalize') {
           setPendingAuthAction(null);
-          openFinalizeGate();
+          startFinalizePreview();
         }
       })
       .catch(err => {
@@ -745,7 +815,7 @@ export default function App() {
       // saveDraftNow never rejects (see its own comment) — even a failed save
       // still leaves the last successfully-saved draft_state for Finalize to
       // read, so proceeding here regardless is intentional, not a swallowed bug.
-      .then(() => postFinalizeTrip(tripId, idKey))
+      .then(() => postFinalizeTrip(tripId, idKey, selectedLodging))
       .then(result => {
         setFinalizeSubmitting(false);
         setFinalizeGateStage(null);
@@ -798,6 +868,11 @@ export default function App() {
         setOriginCoord({ lat: result.origin.lat, lng: result.origin.lon });
         setDestCoord({ lat: result.destination.lat, lng: result.destination.lon });
         setFinalizeJobId(null);
+        // This attempt's lodging pick is spent — clear it so a LATER
+        // finalize (re-finalizing this same trip, or a different one)
+        // starts from a fresh preview, not a stale selection.
+        setFinalizePreview(null);
+        setSelectedLodging(null);
         setPhase('finalized');
         if (result.is_first_finalize) {
           setShowWelcomeModal(true);
@@ -819,6 +894,8 @@ export default function App() {
   // the draft, which was never touched.
   const handleFinalizeJobFailed = (error: string | null) => {
     setFinalizeJobId(null);
+    setFinalizePreview(null);
+    setSelectedLodging(null);
     setPhase('plan');
     getCredits().then(setCredits).catch(() => {});
     setMessages(prev => [...prev, {
@@ -1249,6 +1326,9 @@ export default function App() {
   let planMarkersForMap: Array<{ stop: ApiStop; included: boolean; order: number | null }>;
   let activeDaySegments: Array<{ points: { lat: number; lng: number }[]; color: string }> = [];
   let dayBoundaryMarkersForMap: Array<{ position: { lat: number; lng: number }; color: string; label: string }> = [];
+  // Фаза ночёвок: only ever populated for 'finalized' — nothing is chosen
+  // yet during the free draft.
+  let lodgingMarkersForMap: Array<{ position: { lat: number; lng: number }; name: string }> = [];
 
   if (phase === 'finalized' && finalizedTrip) {
     const finOrigin = { lat: finalizedTrip.origin.lat, lng: finalizedTrip.origin.lon };
@@ -1294,6 +1374,13 @@ export default function App() {
         ? { position: { lat: firstStop.lat, lng: firstStop.lon }, color: dayColor(dayIdx), label: `Д${day.day}` }
         : null;
     }).filter((m): m is { position: { lat: number; lng: number }; color: string; label: string } => m != null);
+
+    lodgingMarkersForMap = finalizedTrip.days
+      .filter(day => day.lodging != null)
+      .map(day => ({
+        position: { lat: day.lodging!.lat, lng: day.lodging!.lon },
+        name: day.lodging!.name,
+      }));
   } else {
     planRouteLinesForMap = options.map((option, idx) => {
       const isActive = idx === activeOptionIndex;
@@ -1761,6 +1848,7 @@ export default function App() {
               planMarkers={planMarkersForMap}
               activeDaySegments={activeDaySegments}
               dayBoundaryMarkers={dayBoundaryMarkersForMap}
+              lodgingMarkers={lodgingMarkersForMap}
               selectedStopId={selectedStopId}
               onSelectStop={handleSelectStop}
               onClosePopup={() => setSelectedStopId(null)}
@@ -1782,6 +1870,7 @@ export default function App() {
               detailedByOption={detailedByOption}
               enrichedByOption={enrichedByOption}
               onFinalizeClick={handleFinalizeClick}
+              finalizePreviewLoading={finalizePreviewLoading}
             />
           )}
 
@@ -1860,6 +1949,17 @@ export default function App() {
           onClose={() => setShowMyTripsModal(false)}
           onOpenTrip={handleOpenTripFromList}
           onDeleteTrip={handleDeleteTripFromList}
+        />
+
+        {/* Between the free preview and the paywall/confirm step — only
+            shown when finalizePreview.needs_selection is true (see
+            startFinalizePreview); otherwise skipped entirely. */}
+        <LodgingSelectionModal
+          isOpen={showLodgingModal}
+          days={finalizePreview?.days ?? []}
+          onContinue={handleLodgingContinue}
+          onSkip={handleLodgingSkip}
+          onCancel={handleLodgingCancel}
         />
 
         {/* Steps 2-3 of Finalize: paywall (balance=0) or the summary+confirm
