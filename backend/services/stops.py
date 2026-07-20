@@ -18,6 +18,36 @@ _PACE_INTERVAL_S = {
     "packed": 2400,
 }
 
+# day_split's second cap (see day_split.split_into_days): total awake time
+# (drive + all visit_s for the day) a pace tolerates being "on" for, on top
+# of the quiz's own drive-only daily_limit_s. Same key set as
+# _PACE_INTERVAL_S on purpose — one pace vocabulary for this whole module.
+_AWAKE_LIMIT_S = {
+    "relaxed": 36000,   # 10h
+    "balanced": 43200,  # 12h
+    "packed": 50400,    # 14h
+}
+
+
+def awake_limit_s_for_pace(pace: str) -> int:
+    """Public (no leading underscore) because finalize.py/main.py — outside
+    this module — need it to resolve the quiz's pace answer into the second
+    day_split.split_into_days ceiling before calling it, the same way they
+    already resolve daily_limit_s from the quiz's "drive" answer themselves.
+    Unknown pace falls back to "balanced", matching every other quiz-driven
+    default in this codebase rather than raising."""
+    return _AWAKE_LIMIT_S.get(pace, _AWAKE_LIMIT_S["balanced"])
+
+# Round-trip return-leg (X->A) dissimilarity thresholds — see
+# _select_dissimilar_return_leg. A candidate whose OSM way_id overlap with
+# the forward leg is >= this is "basically the same road" and rejected in
+# favor of a more different one; a candidate that takes longer than this
+# ratio over the fastest return option is rejected as too much of a detour
+# even if it IS different. Named constants, never inlined, per this
+# feature's own spec.
+ROUND_TRIP_MAX_OVERLAP = 0.70
+ROUND_TRIP_MAX_DETOUR_RATIO = 1.30
+
 
 def _thin_points(points: list[tuple[float, float]], max_points: int = _MAX_WKT_POINTS) -> list[tuple[float, float]]:
     """Прореживает точки маршрута, сохраняя первую и последнюю."""
@@ -99,6 +129,7 @@ async def _find_stops_for_route(
     limit: int,
     min_review_count: int,
     min_endpoint_distance_s: int | None,
+    mark_and_sort: bool = True,
 ) -> dict:
     """Оркестрирует poi.py и detour.py для УЖЕ ГОТОВОГО маршрута (shape + duration),
     не вызывая routing заново — так compare_routes может посчитать остановки для
@@ -118,6 +149,13 @@ async def _find_stops_for_route(
     baseline_s is this option's own corridor duration — a deliberate mismatch:
     detour_s now means "how much longer THIS route becomes if you detour here",
     which is what's needed. Precision could improve later if it matters.
+
+    mark_and_sort=False skips _mark_suggested + the to_poi_s sort at the end,
+    returning stops in whatever order compute_detours produced them — used by
+    round-trip callers (_find_stops_for_round_trip) that need to deduplicate
+    a leg's candidates against the OTHER leg's before "suggested" gets marked,
+    so a POI that loses the dedup tiebreak never occupies a suggested slot on
+    a leg it doesn't end up appearing on.
     """
     decoded_points = polyline_lib.decode(route_shape, 6)
     route_wkt = _to_linestring_wkt(_thin_points(decoded_points))
@@ -202,11 +240,12 @@ async def _find_stops_for_route(
         else:
             unreachable.append({"id": candidate["id"], "name": candidate["name"]})
 
-    _mark_suggested(stops, baseline_s, pace)
-
-    # Natural reading order is position along the route (time from origin), not
-    # detour size — detour_s stays in the response as a filter/metric, not an order.
-    stops.sort(key=lambda s: s["to_poi_s"])
+    if mark_and_sort:
+        _mark_suggested(stops, baseline_s, pace)
+        # Natural reading order is position along the route (time from origin),
+        # not detour size — detour_s stays in the response as a filter/metric,
+        # not an order.
+        stops.sort(key=lambda s: s["to_poi_s"])
 
     return {
         "baseline_s": baseline_s,
@@ -216,6 +255,104 @@ async def _find_stops_for_route(
         "unreachable": unreachable,
         "near_endpoints": near_endpoints,
         "min_endpoint_distance_s_used": min_endpoint_distance_s_used,
+    }
+
+
+def _dedupe_round_trip_stops(leg1_stops: list[dict], leg2_stops: list[dict]) -> tuple[list[dict], list[dict]]:
+    """A round trip's two legs (A->pivot, pivot->A) each search the corridor
+    independently — the SAME POI can turn up in both (roads run close
+    together, or the return leg retraces part of the outbound one). This
+    keeps each POI on exactly one leg: whichever leg gives it the SMALLER
+    detour_s, since that's the leg a real traveler would actually detour
+    from; dropped entirely from the other. Identity is the POI's own
+    database id (public.attractions.id, see poi.py) — stable regardless of
+    which leg's matrix computed it.
+
+    detour.py itself is untouched — this runs strictly AFTER both legs'
+    detours are already computed (each against its own leg's baseline_s),
+    it only decides which of two already-computed detours wins.
+    """
+    leg1_by_id = {s["id"]: s for s in leg1_stops}
+    leg2_by_id = {s["id"]: s for s in leg2_stops}
+    shared_ids = set(leg1_by_id) & set(leg2_by_id)
+
+    drop_from_leg1 = set()
+    drop_from_leg2 = set()
+    for sid in shared_ids:
+        if leg1_by_id[sid]["detour_s"] <= leg2_by_id[sid]["detour_s"]:
+            drop_from_leg2.add(sid)
+        else:
+            drop_from_leg1.add(sid)
+
+    return (
+        [s for s in leg1_stops if s["id"] not in drop_from_leg1],
+        [s for s in leg2_stops if s["id"] not in drop_from_leg2],
+    )
+
+
+async def find_stops_for_round_trip(
+    leg1_shape: str,
+    leg1_baseline_s: int,
+    leg2_shape: str,
+    leg2_baseline_s: int,
+    origin: tuple[float, float],
+    pivot: tuple[float, float],
+    categories: list[str],
+    max_detour_s: int,
+    pace: str,
+    radius_m: int,
+    limit: int,
+    min_review_count: int,
+) -> dict:
+    """POI search for BOTH legs of a round trip (A->pivot, pivot->A) — each
+    leg searched, detour-scored (against its OWN baseline_s — see
+    _find_stops_for_route's own docstring on why baseline_s must be the
+    corridor's, not a matrix-derived one) and suggested-marked exactly as a
+    plain one-way route would be, just twice, then deduplicated against each
+    other (see _dedupe_round_trip_stops).
+
+    Every leg2 stop's to_poi_s is offset by (leg1_baseline_s + max_detour_s)
+    on the way out, and every stop is tagged "leg": 0 or 1 — see the module-
+    level comment on why (single global to_poi_s ordering the rest of the
+    app, including draft_state/finalize.py, never has to know round trips
+    exist; "leg" is what finalize.py uses to split included stops back into
+    the two legs when it has to build two separate routes/searches again).
+    """
+    leg1_result = await _find_stops_for_route(
+        route_shape=leg1_shape, baseline_s=leg1_baseline_s, origin=origin, destination=pivot,
+        categories=categories, max_detour_s=max_detour_s, pace=pace, radius_m=radius_m, limit=limit,
+        min_review_count=min_review_count, min_endpoint_distance_s=None, mark_and_sort=False,
+    )
+    leg2_result = await _find_stops_for_route(
+        route_shape=leg2_shape, baseline_s=leg2_baseline_s, origin=pivot, destination=origin,
+        categories=categories, max_detour_s=max_detour_s, pace=pace, radius_m=radius_m, limit=limit,
+        min_review_count=min_review_count, min_endpoint_distance_s=None, mark_and_sort=False,
+    )
+
+    leg1_stops, leg2_stops = _dedupe_round_trip_stops(leg1_result["stops"], leg2_result["stops"])
+
+    _mark_suggested(leg1_stops, leg1_baseline_s, pace)
+    _mark_suggested(leg2_stops, leg2_baseline_s, pace)
+    leg1_stops.sort(key=lambda s: s["to_poi_s"])
+    leg2_stops.sort(key=lambda s: s["to_poi_s"])
+
+    # Provably safe, not just "usually fine": every leg1 stop that survives
+    # the max_detour_s filter has to_poi_s + from_poi_s - baseline_s <=
+    # max_detour_s (detour.py's own filter condition), and from_poi_s >= 0,
+    # so to_poi_s <= leg1_baseline_s + max_detour_s ALWAYS holds. Offsetting
+    # leg2 by exactly that sum guarantees every leg2 stop's adjusted
+    # to_poi_s exceeds every leg1 stop's — no interleaving is possible,
+    # not even in principle.
+    offset = leg1_baseline_s + max_detour_s
+    for s in leg1_stops:
+        s["leg"] = 0
+    for s in leg2_stops:
+        s["to_poi_s"] = s["to_poi_s"] + offset
+        s["leg"] = 1
+
+    return {
+        "leg1": {**leg1_result, "stops": leg1_stops},
+        "leg2": {**leg2_result, "stops": leg2_stops},
     }
 
 
@@ -374,6 +511,73 @@ async def build_route_through(
     }
 
 
+def _concat_shapes(shape1: str, shape2: str) -> str:
+    """Concatenates two precision-6 Valhalla polylines into one, dropping the
+    duplicate point at the join (both end/start at the same coordinate — the
+    pivot) the same way routing.get_route_multi already does for a single
+    multi-leg Valhalla response."""
+    points1 = polyline_lib.decode(shape1, 6)
+    points2 = polyline_lib.decode(shape2, 6)
+    if points1 and points2 and points1[-1] == points2[0]:
+        points2 = points2[1:]
+    return polyline_lib.encode(points1 + points2, 6)
+
+
+async def build_route_through_round_trip(
+    origin: tuple[float, float],
+    pivot: tuple[float, float],
+    leg1_stop_coords: list[tuple[float, float]],
+    leg2_stop_coords: list[tuple[float, float]],
+    leg1_corridor_shape: str | None = None,
+    leg2_corridor_shape: str | None = None,
+    corridor_via_count: int = 8,
+) -> dict:
+    """Round-trip counterpart to build_route_through: TWO independent Valhalla
+    calls — A->pivot via leg1's stops, pivot->A via leg2's stops, in that
+    order — concatenated. Same "never force the return down the outbound
+    road" reasoning as the module docstring: the second call is free to land
+    on a different real-world route than the first, nothing here ties them
+    together beyond sharing the pivot as one call's destination and the
+    other's origin.
+
+    Returned "legs" is already day-split-ready, exactly like one-way
+    build_route_through's — same convention, so finalize.py can call
+    day_split.split_into_days(through["legs"], stop_count=len(leg1)+len(leg2), ...)
+    completely unchanged from the one-way call site. That means the two legs
+    adjacent to the pivot (last-leg1-stop/origin -> pivot, and
+    pivot -> first-leg2-stop/origin) are summed into ONE hop here — the
+    pivot never gets its own index, exactly as directions.py's
+    get_route_detail_round_trip does for the Google-routed path. Every other
+    leg keeps its own from_index/to_index, renumbered onto one continuous
+    origin(0) -> leg1 stops -> leg2 stops -> origin(stop_count+1) sequence.
+    """
+    leg1_result = await build_route_through(
+        origin, pivot, leg1_stop_coords, corridor_shape=leg1_corridor_shape, corridor_via_count=corridor_via_count,
+    )
+    leg2_result = await build_route_through(
+        pivot, origin, leg2_stop_coords, corridor_shape=leg2_corridor_shape, corridor_via_count=corridor_via_count,
+    )
+
+    l1 = len(leg1_stop_coords)
+    pivot_leg = {
+        "from_index": l1,
+        "to_index": l1 + 1,
+        "duration_s": leg1_result["legs"][-1]["duration_s"] + leg2_result["legs"][0]["duration_s"],
+        "distance_km": leg1_result["legs"][-1]["distance_km"] + leg2_result["legs"][0]["distance_km"],
+    }
+    leg2_tail_legs = [
+        {**leg, "from_index": leg["from_index"] + l1, "to_index": leg["to_index"] + l1}
+        for leg in leg2_result["legs"][1:]
+    ]
+
+    return {
+        "total_s": leg1_result["total_s"] + leg2_result["total_s"],
+        "distance_km": leg1_result["distance_km"] + leg2_result["distance_km"],
+        "route_shape": _concat_shapes(leg1_result["route_shape"], leg2_result["route_shape"]),
+        "legs": leg1_result["legs"][:-1] + [pivot_leg] + leg2_tail_legs,
+    }
+
+
 async def compare_routes(
     origin: tuple[float, float],
     destination: tuple[float, float],
@@ -384,10 +588,30 @@ async def compare_routes(
     radius_m: int = 20000,
     limit: int = 50,
     min_review_count: int = 20,
+    round_trip: bool = False,
 ) -> dict:
     """Fetches up to `alternates` route alternatives and, for each, the stops along
     it plus the real through-route built from its suggested stops — so the caller
-    can compare options on actual numbers, not just raw drive time."""
+    can compare options on actual numbers, not just raw drive time.
+
+    round_trip=True treats `destination` as the pivot X of an A->X->A loop (see
+    find_stops_for_round_trip / build_route_through_round_trip): alternates are
+    fetched for BOTH legs independently, and each forward-leg alternate is
+    paired with whichever return-leg candidate is LEAST road-similar to it
+    (by OSM way_id overlap, not rank — see _select_dissimilar_return_leg),
+    so the return leg surfaces new POIs instead of retracing the outbound
+    corridor, without forcing a detour nobody asked for. Each resulting
+    option dict is shaped exactly like one-way's (same keys), so the existing
+    option-tab UI needs no round-trip-specific handling — the "stops" list
+    simply carries stops from both legs (each tagged "leg": 0 or 1, already
+    globally ordered by to_poi_s per find_stops_for_round_trip's offset trick).
+    """
+    if round_trip:
+        return await _compare_routes_round_trip(
+            origin=origin, pivot=destination, categories=categories, max_detour_s=max_detour_s,
+            pace=pace, alternates=alternates, radius_m=radius_m, limit=limit, min_review_count=min_review_count,
+        )
+
     route_options = await routing.get_route_alternates(origin, destination, alternates)
 
     async def _build_option(index: int, route_option: dict) -> dict:
@@ -462,6 +686,164 @@ async def compare_routes(
 
     options = await asyncio.gather(
         *[_build_option(i, route_option) for i, route_option in enumerate(route_options)]
+    )
+
+    return {"options": list(options)}
+
+
+def _select_dissimilar_return_leg(
+    forward_ways: set[int],
+    candidates: list[dict],
+    candidate_ways: list[set[int]],
+) -> dict:
+    """Picks the return leg (X->A) that's most road-DIFFERENT from the forward
+    leg (A->X), so the loop surfaces new POIs instead of retracing the same
+    corridor twice — while still refusing to force a detour nobody asked for.
+
+    "Different" is measured by OSM way_id overlap, not geometry: parallel
+    carriageways of the same physical road share one way_id, so a geometric
+    (lat/lon) comparison would flag them as different when they aren't.
+    `candidates` is Valhalla's primary return route plus its alternates
+    (already fetched, primary first — candidates[0] is `fastest_return`);
+    `candidate_ways` is each one's way_id set, in the same order, computed
+    ONCE by the caller (never per forward leg this gets compared against).
+
+    Among candidates with overlap < ROUND_TRIP_MAX_OVERLAP AND a duration no
+    more than ROUND_TRIP_MAX_DETOUR_RATIO times fastest_return's, the one
+    with the SMALLEST overlap wins. If none clears both bars — or
+    forward_ways/a candidate's own ways came back empty (trace_attributes
+    failed, see routing.way_ids_for_shape) — fall back to fastest_return
+    silently: the same/fastest road is a fine default, a forced detour with
+    no confirmed payoff is not.
+    """
+    fastest_return = candidates[0]
+    if not forward_ways:
+        return fastest_return
+
+    best: dict | None = None
+    best_overlap: float | None = None
+    for cand, cand_ways in zip(candidates, candidate_ways):
+        if not cand_ways:
+            continue
+        overlap = len(cand_ways & forward_ways) / len(cand_ways)
+        detour_penalty = cand["duration_s"] / fastest_return["duration_s"]
+        if overlap < ROUND_TRIP_MAX_OVERLAP and detour_penalty <= ROUND_TRIP_MAX_DETOUR_RATIO:
+            if best is None or overlap < best_overlap:
+                best = cand
+                best_overlap = overlap
+
+    return best if best is not None else fastest_return
+
+
+async def _compare_routes_round_trip(
+    origin: tuple[float, float],
+    pivot: tuple[float, float],
+    categories: list[str],
+    max_detour_s: int,
+    pace: str,
+    alternates: int,
+    radius_m: int,
+    limit: int,
+    min_review_count: int,
+) -> dict:
+    """round_trip=True branch of compare_routes — split out for the same reason
+    _build_option is nested rather than duplicated: keeps the per-option
+    assembly next to the data it closes over.
+
+    Each forward-leg alternate (leg1_options[i]) is paired with whichever
+    return-leg candidate (from the FULL leg2_options pool, not the same-rank
+    one) _select_dissimilar_return_leg picks as least road-similar to it —
+    see that function's docstring. way_id sets are fetched once per forward
+    option and once per return candidate (not once per PAIR), so this costs
+    len(leg1_options) + len(leg2_options) trace_attributes calls, not their
+    product.
+    """
+    leg1_options, leg2_options = await asyncio.gather(
+        routing.get_route_alternates(origin, pivot, alternates),
+        routing.get_route_alternates(pivot, origin, alternates),
+    )
+    if not leg1_options or not leg2_options:
+        return {"options": []}
+
+    leg2_candidate_ways = await asyncio.gather(
+        *[routing.way_ids_for_shape(c["shape"]) for c in leg2_options]
+    )
+
+    async def _build_round_trip_option(index: int, leg1_route_option: dict) -> dict:
+        forward_ways = await routing.way_ids_for_shape(leg1_route_option["shape"])
+        leg2_route_option = _select_dissimilar_return_leg(forward_ways, leg2_options, list(leg2_candidate_ways))
+        stops_result = await find_stops_for_round_trip(
+            leg1_shape=leg1_route_option["shape"],
+            leg1_baseline_s=leg1_route_option["duration_s"],
+            leg2_shape=leg2_route_option["shape"],
+            leg2_baseline_s=leg2_route_option["duration_s"],
+            origin=origin,
+            pivot=pivot,
+            categories=categories,
+            max_detour_s=max_detour_s,
+            pace=pace,
+            radius_m=radius_m,
+            limit=limit,
+            min_review_count=min_review_count,
+        )
+        leg1_stops = stops_result["leg1"]["stops"]
+        leg2_stops = stops_result["leg2"]["stops"]
+        stops = leg1_stops + leg2_stops
+
+        leg1_suggested_coords = [(s["lat"], s["lon"]) for s in leg1_stops if s["suggested"]]
+        leg2_suggested_coords = [(s["lat"], s["lon"]) for s in leg2_stops if s["suggested"]]
+
+        baseline_s = leg1_route_option["duration_s"] + leg2_route_option["duration_s"]
+
+        through_shape = None
+        total_s = None
+        delta_s = None
+        try:
+            through_result = await build_route_through_round_trip(
+                origin, pivot, leg1_suggested_coords, leg2_suggested_coords,
+                leg1_corridor_shape=leg1_route_option["shape"],
+                leg2_corridor_shape=leg2_route_option["shape"],
+            )
+            through_shape = through_result["route_shape"]
+            total_s = through_result["total_s"]
+            delta_s = total_s - baseline_s
+        except httpx.HTTPError:
+            pass
+
+        ratings = [s["rating"] for s in stops if s["rating"] is not None]
+        avg_rating = sum(ratings) / len(ratings) if ratings else None
+
+        top_stops = sorted(stops, key=lambda s: s["review_count"] or 0, reverse=True)[:3]
+        top_stops = [
+            {
+                "id": s["id"],
+                "name": s["name"],
+                "category": s["category"],
+                "rating": s["rating"],
+                "review_count": s["review_count"],
+                "detour_s": s["detour_s"],
+            }
+            for s in top_stops
+        ]
+
+        return {
+            "index": index,
+            "duration_s": baseline_s,
+            "distance_km": leg1_route_option["distance_km"] + leg2_route_option["distance_km"],
+            "route_shape": _concat_shapes(leg1_route_option["shape"], leg2_route_option["shape"]),
+            "through_shape": through_shape,
+            "total_s": total_s,
+            "delta_s": delta_s,
+            "stops": stops,
+            "candidates_found": stops_result["leg1"]["candidates_found"] + stops_result["leg2"]["candidates_found"],
+            "avg_rating": avg_rating,
+            "top_stops": top_stops,
+            "near_endpoints": stops_result["leg1"]["near_endpoints"] + stops_result["leg2"]["near_endpoints"],
+            "unreachable": stops_result["leg1"]["unreachable"] + stops_result["leg2"]["unreachable"],
+        }
+
+    options = await asyncio.gather(
+        *[_build_round_trip_option(i, opt) for i, opt in enumerate(leg1_options)]
     )
 
     return {"options": list(options)}

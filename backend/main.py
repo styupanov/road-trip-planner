@@ -466,6 +466,10 @@ class StopOut(BaseModel):
     to_poi_s: int
     from_poi_s: int
     suggested: bool
+    # 0 or 1 for a round-trip option's stops (which leg it's on — see
+    # services.stops.find_stops_for_round_trip); None for a one-way option,
+    # which has no legs to distinguish.
+    leg: int | None = None
 
 
 class UnreachableOut(BaseModel):
@@ -510,7 +514,14 @@ async def stops(req: StopsRequest):
 class RouteThroughRequest(BaseModel):
     origin: LatLon
     destination: LatLon
-    stops: list[LatLon]
+    # One-way: `stops`, ordered, as before. Round-trip: `leg1_stops`/
+    # `leg2_stops` instead (destination is the loop's pivot X) — `stops`
+    # stays empty and unused in that case, never mixed with the per-leg
+    # fields.
+    stops: list[LatLon] = []
+    round_trip: bool = False
+    leg1_stops: list[LatLon] = []
+    leg2_stops: list[LatLon] = []
 
 
 class RouteLegOut(BaseModel):
@@ -533,13 +544,24 @@ class RouteThroughResponse(BaseModel):
 async def route_through(req: RouteThroughRequest):
     origin = (req.origin.lat, req.origin.lon)
     destination = (req.destination.lat, req.destination.lon)
-    stop_coords = [(s.lat, s.lon) for s in req.stops]
 
     try:
-        baseline = await asyncio.to_thread(
-            routing.get_route, origin[0], origin[1], destination[0], destination[1]
-        )
-        result = await stops_service.build_route_through(origin, destination, stop_coords)
+        if req.round_trip:
+            leg1_coords = [(s.lat, s.lon) for s in req.leg1_stops]
+            leg2_coords = [(s.lat, s.lon) for s in req.leg2_stops]
+            leg1_baseline, leg2_baseline = await asyncio.gather(
+                asyncio.to_thread(routing.get_route, origin[0], origin[1], destination[0], destination[1]),
+                asyncio.to_thread(routing.get_route, destination[0], destination[1], origin[0], origin[1]),
+            )
+            baseline_s = leg1_baseline["duration_seconds"] + leg2_baseline["duration_seconds"]
+            result = await stops_service.build_route_through_round_trip(origin, destination, leg1_coords, leg2_coords)
+        else:
+            stop_coords = [(s.lat, s.lon) for s in req.stops]
+            baseline = await asyncio.to_thread(
+                routing.get_route, origin[0], origin[1], destination[0], destination[1]
+            )
+            baseline_s = baseline["duration_seconds"]
+            result = await stops_service.build_route_through(origin, destination, stop_coords)
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=502, detail=f"Valhalla routing error: {e.response.text}"
@@ -547,7 +569,6 @@ async def route_through(req: RouteThroughRequest):
     except httpx.RequestError:
         raise HTTPException(status_code=503, detail="Valhalla routing service unavailable")
 
-    baseline_s = baseline["duration_seconds"]
     return {
         **result,
         "baseline_s": baseline_s,
@@ -569,6 +590,11 @@ class DetailRouteRequest(BaseModel):
     # below — the backend never uses this to alter the route or the split.
     planned_days: int | None = None
     flexible_days: bool = False
+    # Drives day_split's second ceiling (awake_limit_s, via
+    # stops_service.awake_limit_s_for_pace) — daily_limit_s alone caps
+    # driving, this caps driving+visit_s together. Same field name/values as
+    # /compare-routes' pace, mapped client-side the same way.
+    pace: Literal["relaxed", "balanced", "packed"] = "balanced"
 
 
 class DetailRouteLegOut(BaseModel):
@@ -619,6 +645,7 @@ async def detail_route(req: DetailRouteRequest):
             visit_s=req.visit_s,
             planned_days=req.planned_days,
             flexible_days=req.flexible_days,
+            awake_limit_s=stops_service.awake_limit_s_for_pace(req.pace),
         )
     except directions.DirectionsError as e:
         raise HTTPException(status_code=502, detail=str(e))
@@ -713,6 +740,11 @@ class FinalizedStopOut(BaseModel):
     why: str
     tips: str | None
     dates_note: str | None
+    # 0 or 1 for a round-trip snapshot's stops (which leg it's on — see
+    # find_stops_for_round_trip); null for one-way, or for a snapshot
+    # finalized before this field existed. Default lets old persisted
+    # trip_versions.snapshot rows (no "leg" key at all) still parse.
+    leg: int | None = None
 
 
 class FinalizedRouteOut(BaseModel):
@@ -765,6 +797,9 @@ class DayPlanOut(BaseModel):
 
 class FinalizedTripOut(BaseModel):
     origin: FinalizedEndpointOut
+    # For round_trip=True, this is the loop's pivot X (e.g. Leadville), NOT
+    # where the trip physically ends — the trip always ends back at `origin`.
+    # See finalize.py's _parse_active_selection/_build_finalized_snapshot.
     destination: FinalizedEndpointOut
     stops: list[FinalizedStopOut]
     route: FinalizedRouteOut
@@ -774,6 +809,10 @@ class FinalizedTripOut(BaseModel):
     trip_dates: str | None
     finalized_at: str
     is_first_finalize: bool
+    # True for an A->X->A loop (see finalize._is_round_trip_from_quiz).
+    # Default False so a trip_versions.snapshot finalized before this field
+    # existed still parses as (correctly) one-way.
+    round_trip: bool = False
 
 
 # Immutable, self-contained result of Finalize (подшаг 3) — built entirely
@@ -797,6 +836,9 @@ class CompareRoutesRequest(BaseModel):
     alternates: int = 2
     radius_m: int = 20000
     limit: int = 50
+    # True treats `destination` as the round trip's pivot X (A->X->A) — see
+    # services.stops.compare_routes' own docstring.
+    round_trip: bool = False
 
 
 class TopStopOut(BaseModel):
@@ -840,6 +882,7 @@ async def compare_routes(req: CompareRoutesRequest):
             alternates=req.alternates,
             radius_m=req.radius_m,
             limit=req.limit,
+            round_trip=req.round_trip,
         )
     except httpx.HTTPStatusError as e:
         raise HTTPException(

@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 import httpx
@@ -116,6 +117,7 @@ async def get_route_detail(
     visit_s: int = 3600,
     planned_days: int | None = None,
     flexible_days: bool = False,
+    awake_limit_s: int = 43200,  # "balanced" pace's cap — see services.stops.awake_limit_s_for_pace
 ) -> dict:
     """Orchestrates get_directions (twice — with the stops, and again with no
     waypoints for the baseline) plus day_split.split_into_days into one
@@ -144,6 +146,7 @@ async def get_route_detail(
         stop_count=len(waypoints),
         daily_limit_s=daily_limit_s,
         visit_s=visit_s,
+        awake_limit_s=awake_limit_s,
     )
     actual_days = len(days)
 
@@ -156,6 +159,94 @@ async def get_route_detail(
         **result,
         "baseline_s": baseline_s,
         "delta_s": result["duration_s"] - baseline_s,
+        "days": days,
+        "planned_days": planned_days,
+        "actual_days": actual_days,
+        "fits_plan": fits_plan,
+    }
+
+
+def concat_shapes_p5(shape1: str, shape2: str) -> str:
+    """Same join-and-dedupe as services.stops._concat_shapes, but for Google's
+    precision-5 polylines — kept separate rather than shared because mixing a
+    precision-5 decode/encode with Valhalla's precision-6 helper would silently
+    corrupt coordinates (see the module docstring on get_directions). Public
+    (no leading underscore) because finalize.py's lodging path needs the same
+    join for its own two independent per-leg Directions results."""
+    points1 = polyline_lib.decode(shape1, 5)
+    points2 = polyline_lib.decode(shape2, 5)
+    if points1 and points2 and points1[-1] == points2[0]:
+        points2 = points2[1:]
+    return polyline_lib.encode(points1 + points2, 5)
+
+
+async def get_route_detail_round_trip(
+    origin: tuple[float, float],
+    pivot: tuple[float, float],
+    leg1_stops: list[tuple[float, float]],
+    leg2_stops: list[tuple[float, float]],
+    daily_limit_s: int = 28800,
+    visit_s: int = 3600,
+    planned_days: int | None = None,
+    flexible_days: bool = False,
+    awake_limit_s: int = 43200,  # "balanced" pace's cap — see services.stops.awake_limit_s_for_pace
+) -> dict:
+    """Round-trip counterpart to get_route_detail: TWO independent Directions
+    legs — A->pivot via leg1_stops, pivot->A via leg2_stops — each with its own
+    Google-measured baseline (no mixing Valhalla numbers in, same reasoning as
+    get_route_detail), concatenated into ONE continuous sequence before
+    day_split ever sees it.
+
+    day_split.py stays completely unmodified and never learns round trips
+    exist: the pivot is made an ordinary, non-day-breaking waypoint purely by
+    merging the two legs adjacent to it (last leg1 hop, first leg2 hop) into a
+    single summed hop, and excluding the pivot from stop_count. That merged
+    legs list — length stop_count+1 where stop_count = len(leg1_stops) +
+    len(leg2_stops) — is also what's returned as "legs", since finalize.py's
+    lodging path slices days back out of exactly this list by n_legs.
+    """
+    (leg1_result, leg1_baseline), (leg2_result, leg2_baseline) = await asyncio.gather(
+        asyncio.gather(
+            get_directions(origin, pivot, leg1_stops),
+            get_directions(origin, pivot, None),
+        ),
+        asyncio.gather(
+            get_directions(pivot, origin, leg2_stops),
+            get_directions(pivot, origin, None),
+        ),
+    )
+    baseline_s = leg1_baseline["duration_s"] + leg2_baseline["duration_s"]
+
+    pivot_leg = {
+        "duration_s": leg1_result["legs"][-1]["duration_s"] + leg2_result["legs"][0]["duration_s"],
+        "distance_km": leg1_result["legs"][-1]["distance_km"] + leg2_result["legs"][0]["distance_km"],
+    }
+    merged_legs = leg1_result["legs"][:-1] + [pivot_leg] + leg2_result["legs"][1:]
+    stop_count = len(leg1_stops) + len(leg2_stops)
+
+    days = day_split.split_into_days(
+        merged_legs,
+        stop_count=stop_count,
+        daily_limit_s=daily_limit_s,
+        visit_s=visit_s,
+        awake_limit_s=awake_limit_s,
+    )
+    actual_days = len(days)
+
+    fits_plan = None
+    if planned_days is not None:
+        allowed = planned_days + (1 if flexible_days else 0)
+        fits_plan = actual_days <= allowed
+
+    duration_s = leg1_result["duration_s"] + leg2_result["duration_s"]
+
+    return {
+        "duration_s": duration_s,
+        "distance_km": leg1_result["distance_km"] + leg2_result["distance_km"],
+        "shape": concat_shapes_p5(leg1_result["shape"], leg2_result["shape"]),
+        "legs": merged_legs,
+        "baseline_s": baseline_s,
+        "delta_s": duration_s - baseline_s,
         "days": days,
         "planned_days": planned_days,
         "actual_days": actual_days,

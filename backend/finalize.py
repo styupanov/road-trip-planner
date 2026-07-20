@@ -205,6 +205,51 @@ def _lodging_radius_m_from_quiz(quiz_answers: dict | None) -> int:
     return round(_max_detour_s_from_quiz(quiz_answers) * _METERS_PER_DETOUR_SECOND)
 
 
+# Mirrors frontend/src/quizMapping.ts::mapPaceToApiPace — same reasoning as
+# _daily_limit_s_from_quiz above. Also THE source of pace for day_split's
+# awake_limit_s (via stops_service.awake_limit_s_for_pace) in this module —
+# reusing this one mapping rather than a second, separately-invented one
+# keeps finalize's day split and the draft's POI-suggestion pace (which reads
+# the same quiz answer, just client-side via /compare-routes) from ever
+# disagreeing on what "relaxed"/"balanced"/"packed" means for a given trip.
+_PACE_TO_API_PACE = {
+    "спокойный": "relaxed",
+    "сбалансированный": "balanced",
+    "насыщенный": "packed",
+}
+_DEFAULT_API_PACE = "relaxed"  # same default as quizMapping.ts, for "спокойный"
+
+
+def _pace_from_quiz(quiz_answers: dict | None) -> str:
+    pace = (quiz_answers or {}).get("pace")
+    if not isinstance(pace, str):
+        return _DEFAULT_API_PACE
+    return _PACE_TO_API_PACE.get(pace, _DEFAULT_API_PACE)
+
+
+def _is_round_trip_from_quiz(quiz_answers: dict | None) -> bool:
+    """Mirrors the frontend QUIZ's "trip" field (src/data.ts) — same re-mapping
+    pattern as _daily_limit_s_from_quiz/_max_detour_s_from_quiz above, since
+    finalize runs server-side from the raw quiz answer, not a client-computed
+    flag."""
+    return (quiz_answers or {}).get("trip") == "Туда и обратно"
+
+
+def _split_included_stops_by_leg(included_stops: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Round-trip's included_stops (from _parse_active_selection) come back as
+    ONE list, already globally ordered by to_poi_s — leg1 stops before leg2
+    stops, per find_stops_for_round_trip's offset trick (services/stops.py).
+    Splits them back into the two legs by their "leg" tag (0/1) so finalize
+    can build/search each leg independently again, the same way
+    compare_routes originally did. A stop missing the tag defaults to leg 0
+    — shouldn't happen for a round-trip option (main.py's StopOut always
+    carries it once populated by find_stops_for_round_trip), but a silent
+    default is safer here than crashing finalize on a stray draft_state."""
+    leg1 = [s for s in included_stops if s.get("leg") != 1]
+    leg2 = [s for s in included_stops if s.get("leg") == 1]
+    return leg1, leg2
+
+
 def _parse_active_selection(trip: dict) -> tuple[tuple[float, float], tuple[float, float], list[dict]]:
     """Active option + its included stops (sorted by to_poi_s, same order
     the free 'plan' phase already sends to /route-through) from
@@ -264,27 +309,43 @@ async def build_finalize_preview(trip: dict) -> dict:
     lodging_options). day_split itself stays entirely unaware that lodging
     exists; see _build_route_detail_with_lodging's docstring for why that
     split is deliberate.
+
+    Round-trip (see _is_round_trip_from_quiz): `destination` here is the
+    loop's pivot X, not where the trip actually ends — build_route_through_
+    round_trip is used instead (same merged, pivot-as-ordinary-waypoint legs
+    day_split expects, see its own docstring), and the LAST day's end_point
+    is `origin` (the trip returns there), not the pivot.
     """
     origin, destination, included_stops = _parse_active_selection(trip)
-    stop_coords = [(s["lat"], s["lon"]) for s in included_stops]
 
     quiz_answers = trip["quiz_answers"] or {}
     daily_limit_s = _daily_limit_s_from_quiz(quiz_answers)
+    awake_limit_s = stops_service.awake_limit_s_for_pace(_pace_from_quiz(quiz_answers))
     radius_m = _lodging_radius_m_from_quiz(quiz_answers)
+    round_trip = _is_round_trip_from_quiz(quiz_answers)
 
-    through = await stops_service.build_route_through(origin, destination, stop_coords)
+    if round_trip:
+        leg1_stops, leg2_stops = _split_included_stops_by_leg(included_stops)
+        leg1_coords = [(s["lat"], s["lon"]) for s in leg1_stops]
+        leg2_coords = [(s["lat"], s["lon"]) for s in leg2_stops]
+        through = await stops_service.build_route_through_round_trip(origin, destination, leg1_coords, leg2_coords)
+    else:
+        stop_coords = [(s["lat"], s["lon"]) for s in included_stops]
+        through = await stops_service.build_route_through(origin, destination, stop_coords)
+
     days = day_split.split_into_days(
         through["legs"], stop_count=len(included_stops),
-        daily_limit_s=daily_limit_s, visit_s=3600,
+        daily_limit_s=daily_limit_s, visit_s=3600, awake_limit_s=awake_limit_s,
     )
 
     has_lodging = False
     last_day_num = days[-1]["day"] if days else None
+    trip_end = origin if round_trip else destination
 
     for day in days:
         is_last = day["day"] == last_day_num
         if is_last:
-            end_point = {"lat": destination[0], "lon": destination[1], "near_stop_name": None}
+            end_point = {"lat": trip_end[0], "lon": trip_end[1], "near_stop_name": None}
         else:
             last_stop = included_stops[day["stop_indices"][-1]]
             end_point = {"lat": last_stop["lat"], "lon": last_stop["lon"], "near_stop_name": last_stop["name"]}
@@ -331,6 +392,7 @@ async def _build_route_detail_with_lodging(
     selected_lodging: list[dict],
     daily_limit_s: int,
     visit_s: int,
+    awake_limit_s: int,
 ) -> dict:
     """Google-routed detail when the user picked lodging for one or more
     nights (Фаза ночёвок, подшаг 3). Waypoints become: day-1 stops,
@@ -361,7 +423,7 @@ async def _build_route_detail_with_lodging(
     through = await stops_service.build_route_through(origin, destination, stop_coords)
     prelim_days = day_split.split_into_days(
         through["legs"], stop_count=len(included_stops),
-        daily_limit_s=daily_limit_s, visit_s=visit_s,
+        daily_limit_s=daily_limit_s, visit_s=visit_s, awake_limit_s=awake_limit_s,
     )
 
     waypoints: list[tuple[float, float]] = []
@@ -401,7 +463,7 @@ async def _build_route_detail_with_lodging(
             "drive_s": drive_s,
             "visit_s": visit_total_s,
             "total_s": drive_s + visit_total_s,
-            "over_limit": (drive_s + visit_total_s) > daily_limit_s,
+            "over_limit": drive_s > daily_limit_s or (drive_s + visit_total_s) > awake_limit_s,
             "lodging": lodging,
         })
         leg_cursor += n_legs
@@ -414,6 +476,142 @@ async def _build_route_detail_with_lodging(
         "legs": result["legs"],
         "baseline_s": baseline["duration_s"],
         "delta_s": result["duration_s"] - baseline["duration_s"],
+        "days": days,
+    }
+
+
+async def _build_route_detail_with_lodging_round_trip(
+    origin: tuple[float, float],
+    pivot: tuple[float, float],
+    leg1_stops: list[dict],
+    leg2_stops: list[dict],
+    selected_lodging: list[dict],
+    daily_limit_s: int,
+    visit_s: int,
+    awake_limit_s: int,
+) -> dict:
+    """Round-trip counterpart to _build_route_detail_with_lodging — same
+    fixed-day-boundary reasoning (day_split.py stays lodging-unaware;
+    boundary POSITIONS come from re-running the free preview's Valhalla
+    split — build_route_through_round_trip's merged, pivot-unaware legs,
+    exactly like build_finalize_preview; every NUMBER in the result is
+    Google's). Extended for the one thing a round trip adds that a one-way
+    route never has: a single day CAN legitimately straddle the leg1/leg2
+    transition, since day_split's greedy algorithm has no concept of a leg
+    boundary to respect.
+
+    Two independent Google Directions calls, one per leg — never a single
+    "origin equals destination" call, per the task spec. Each leg's day-by-
+    day leg count mirrors the one-way function's own "stop_count + lodging +
+    is_last" formula applied to ITS half of the trip:
+    - leg1 gets an extra +1 on whichever day its cumulative stop count first
+      reaches its own total — that's leg1's own "reached the destination"
+      day, the pivot just happens to be that destination.
+    - leg2 needs NO special-casing for the hop OUT of the pivot at all: it's
+      just the ordinary "hop into this day's first stop", already covered by
+      leg2's own stop_count the same way every other stop's entry hop is.
+    - Lodging picked for a day that has already reached the pivot (by that
+      day's end) sits on leg2's route; otherwise leg1's — a night can't be
+      picked "at the pivot" itself, only somewhere along one of the two legs.
+    """
+    included_stops = leg1_stops + leg2_stops
+    l1 = len(leg1_stops)
+    lodging_by_day = {entry["day"]: entry for entry in selected_lodging}
+
+    leg1_coords = [(s["lat"], s["lon"]) for s in leg1_stops]
+    leg2_coords = [(s["lat"], s["lon"]) for s in leg2_stops]
+    through = await stops_service.build_route_through_round_trip(origin, pivot, leg1_coords, leg2_coords)
+    prelim_days = day_split.split_into_days(
+        through["legs"], stop_count=len(included_stops),
+        daily_limit_s=daily_limit_s, visit_s=visit_s, awake_limit_s=awake_limit_s,
+    )
+
+    leg1_waypoints: list[tuple[float, float]] = []
+    leg2_waypoints: list[tuple[float, float]] = []
+    day_leg1_counts: list[int] = []
+    day_leg2_counts: list[int] = []
+    day_lodging: list[dict | None] = []
+    day_has_pivot: list[bool] = []
+
+    leg1_running = 0
+    pivot_assigned = False
+    for day in prelim_days:
+        stop_indices = day["stop_indices"]
+        leg1_count = sum(1 for idx in stop_indices if idx < l1)
+        leg2_count = len(stop_indices) - leg1_count
+        for idx in stop_indices:
+            stop = included_stops[idx]
+            (leg1_waypoints if idx < l1 else leg2_waypoints).append((stop["lat"], stop["lon"]))
+
+        leg1_running += leg1_count
+        has_pivot = False
+        if not pivot_assigned and leg1_running >= l1:
+            has_pivot = True
+            pivot_assigned = True
+
+        lodging = lodging_by_day.get(day["day"])
+        if lodging is not None:
+            (leg2_waypoints if has_pivot else leg1_waypoints).append((lodging["lat"], lodging["lon"]))
+
+        day_leg1_counts.append(leg1_count)
+        day_leg2_counts.append(leg2_count)
+        day_lodging.append(lodging)
+        day_has_pivot.append(has_pivot)
+
+    # Shouldn't happen (leg1_running caps out at l1 once every leg1 stop has
+    # been seen, and >= l1 is already true from day 1 when l1 == 0), but
+    # fail safe onto the last day the same way the final leg into the
+    # destination always closes wherever it lands, one-way or not.
+    if not pivot_assigned and day_has_pivot:
+        day_has_pivot[-1] = True
+
+    leg1_result = await directions.get_directions(origin, pivot, leg1_waypoints)
+    leg2_result = await directions.get_directions(pivot, origin, leg2_waypoints)
+    leg1_baseline = await directions.get_directions(origin, pivot, None)
+    leg2_baseline = await directions.get_directions(pivot, origin, None)
+    baseline_s = leg1_baseline["duration_s"] + leg2_baseline["duration_s"]
+
+    days: list[dict] = []
+    leg1_cursor = 0
+    leg2_cursor = 0
+    n_days = len(prelim_days)
+    for i, day in enumerate(prelim_days):
+        is_last_day = i == n_days - 1
+        lodging = day_lodging[i]
+        leg1_lodge = 1 if (lodging is not None and not day_has_pivot[i]) else 0
+        leg2_lodge = 1 if (lodging is not None and day_has_pivot[i]) else 0
+
+        n_leg1 = day_leg1_counts[i] + (1 if day_has_pivot[i] else 0) + leg1_lodge
+        n_leg2 = day_leg2_counts[i] + leg2_lodge + (1 if is_last_day else 0)
+
+        leg1_day_legs = leg1_result["legs"][leg1_cursor: leg1_cursor + n_leg1]
+        leg2_day_legs = leg2_result["legs"][leg2_cursor: leg2_cursor + n_leg2]
+        leg1_cursor += n_leg1
+        leg2_cursor += n_leg2
+
+        drive_s = sum(leg["duration_s"] for leg in leg1_day_legs) + sum(leg["duration_s"] for leg in leg2_day_legs)
+        stop_count = len(day["stop_indices"])
+        visit_total_s = visit_s * stop_count
+
+        days.append({
+            "day": day["day"],
+            "stop_indices": day["stop_indices"],
+            "drive_s": drive_s,
+            "visit_s": visit_total_s,
+            "total_s": drive_s + visit_total_s,
+            "over_limit": drive_s > daily_limit_s or (drive_s + visit_total_s) > awake_limit_s,
+            "lodging": lodging,
+        })
+
+    duration_s = leg1_result["duration_s"] + leg2_result["duration_s"]
+
+    return {
+        "duration_s": duration_s,
+        "distance_km": leg1_result["distance_km"] + leg2_result["distance_km"],
+        "shape": directions.concat_shapes_p5(leg1_result["shape"], leg2_result["shape"]),
+        "legs": leg1_result["legs"] + leg2_result["legs"],
+        "baseline_s": baseline_s,
+        "delta_s": duration_s - baseline_s,
         "days": days,
     }
 
@@ -456,17 +654,40 @@ async def _build_finalized_snapshot(
     planned_days = int(planned_days_raw) if isinstance(planned_days_raw, (int, float)) else None
     flexible_days = bool(quiz_answers.get("flexible_days"))
     daily_limit_s = _daily_limit_s_from_quiz(quiz_answers)
+    awake_limit_s = stops_service.awake_limit_s_for_pace(_pace_from_quiz(quiz_answers))
 
     trip_dates = quiz_answers.get("trip_dates")
     if not isinstance(trip_dates, str):
         trip_dates = None
 
+    round_trip = _is_round_trip_from_quiz(quiz_answers)
+
     # Slow, paid external call #1 — deliberately outside any DB transaction
     # (see process_finalization's docstring). Raises on failure, uncaught.
-    if selected_lodging:
+    # `destination` here is the loop's pivot X when round_trip — see
+    # _parse_active_selection / build_finalize_preview.
+    if selected_lodging and round_trip:
+        leg1_stops, leg2_stops = _split_included_stops_by_leg(included_stops)
+        route_detail = await _build_route_detail_with_lodging_round_trip(
+            origin, destination, leg1_stops, leg2_stops, selected_lodging,
+            daily_limit_s=daily_limit_s, visit_s=3600, awake_limit_s=awake_limit_s,
+        )
+    elif selected_lodging:
         route_detail = await _build_route_detail_with_lodging(
             origin, destination, included_stops, selected_lodging,
-            daily_limit_s=daily_limit_s, visit_s=3600,
+            daily_limit_s=daily_limit_s, visit_s=3600, awake_limit_s=awake_limit_s,
+        )
+    elif round_trip:
+        leg1_stops, leg2_stops = _split_included_stops_by_leg(included_stops)
+        leg1_coords = [(s["lat"], s["lon"]) for s in leg1_stops]
+        leg2_coords = [(s["lat"], s["lon"]) for s in leg2_stops]
+        route_detail = await directions.get_route_detail_round_trip(
+            origin, destination, leg1_coords, leg2_coords,
+            daily_limit_s=daily_limit_s,
+            visit_s=3600,
+            planned_days=planned_days,
+            flexible_days=flexible_days,
+            awake_limit_s=awake_limit_s,
         )
     else:
         waypoints = [(s["lat"], s["lon"]) for s in included_stops]
@@ -476,6 +697,7 @@ async def _build_finalized_snapshot(
             visit_s=3600,
             planned_days=planned_days,
             flexible_days=flexible_days,
+            awake_limit_s=awake_limit_s,
         )
 
     enrich_dto = stops_service.build_enrichment_dto(
@@ -522,6 +744,11 @@ async def _build_finalized_snapshot(
             "why": e["why"] if e else "",
             "tips": e.get("tips") if e else None,
             "dates_note": e.get("dates_note") if e else None,
+            # None for one-way — round_trip's stops always carry 0/1 (see
+            # find_stops_for_round_trip) — needed by the frontend to know
+            # where to insert the pivot X when it draws the loop (X is never
+            # itself a stop, see _parse_active_selection).
+            "leg": s.get("leg"),
         })
 
     # Uniform day shape regardless of path taken above — "lodging" is always
@@ -587,6 +814,7 @@ async def _build_finalized_snapshot(
         },
         "trip_dates": trip_dates,
         "finalized_at": datetime.now(timezone.utc).isoformat(),
+        "round_trip": round_trip,
     }
 
 

@@ -100,12 +100,14 @@ const DayLodgingSection: React.FC<{
         )}
       </div>
       {day.over_limit && (
+        // Same either-cause flag as PlanPanel's badge (see its comment) —
+        // day_split.py's over_limit no longer means "driving time" specifically.
         <span
           className="flex items-center gap-1 text-[9px] uppercase tracking-wide text-[#c05640] font-mono flex-shrink-0"
-          title="Переезд в этот день длиннее заданного лимита вождения"
+          title="Этот день превышает лимит вождения или бодрствования"
         >
           <AlertTriangle size={10} className="flex-shrink-0" />
-          длиннее вашего лимита вождения
+          день перегружен
         </span>
       )}
     </div>

@@ -1,11 +1,27 @@
+# Default matches "balanced" pace's own cap (see services.stops's
+# _AWAKE_LIMIT_S / awake_limit_s_for_pace) — used only when a caller doesn't
+# have a pace-derived value to pass in yet.
+_DEFAULT_AWAKE_LIMIT_S = 43200
+
+
 def split_into_days(
     legs: list[dict],
     stop_count: int,
     daily_limit_s: int = 28800,
     visit_s: int = 3600,
+    awake_limit_s: int = _DEFAULT_AWAKE_LIMIT_S,
 ) -> list[dict]:
     """Greedily splits a route (origin -> stop_1 -> ... -> stop_N -> dest) into
-    driving days against a soft daily time ceiling.
+    driving days against TWO independent soft ceilings — a day closes as soon
+    as adding the next stop would breach EITHER one:
+    - daily_limit_s: DRIVING time alone (the quiz's "hours behind the wheel"
+      answer). visit_s never counts toward this one.
+    - awake_limit_s: driving + ALL visit_s for the day, combined (how long
+      the trip's pace tolerates being "on" for — see services.stops's
+      awake_limit_s_for_pace). This is the only one visit_s affects.
+    Whichever limit is hit first closes the day; a day can end up flagged
+    over_limit for either reason (see close_day below) — this function
+    doesn't distinguish which one to the caller, that's a display concern.
 
     `legs` is per-hop drive time, length stop_count + 1: legs[i] is the drive
     from the previous point to stop i (for i < stop_count), and legs[stop_count]
@@ -14,12 +30,12 @@ def split_into_days(
     see the day dict's own "visit_s" field for why that matters downstream.
 
     A day never closes empty-handed: the first stop considered for a fresh day
-    is always added to it, even if its own leg + visit alone exceeds
-    daily_limit_s — the alternative is losing the stop entirely, which is worse
-    than a day flagged over_limit. Whether a day is over_limit is decided by
-    its actual total against the limit, not by tracking which case produced
-    it — that stays true whether the culprit was one huge leg or (in principle)
-    boundary rounding, so there's exactly one place this is decided.
+    is always added to it, even if its own leg alone exceeds daily_limit_s (or
+    leg + visit alone exceeds awake_limit_s) — the alternative is losing the
+    stop entirely, which is worse than a day flagged over_limit. Splitting
+    THAT single oversized leg mid-drive (e.g. at some hypothetical overnight
+    point along it) is out of scope here — day boundaries only ever fall on
+    stop points, never inside a leg.
     """
     if len(legs) != stop_count + 1:
         raise ValueError(
@@ -41,7 +57,7 @@ def split_into_days(
             "drive_s": drive_s,
             "visit_s": visit_total_s,
             "total_s": total_s,
-            "over_limit": total_s > daily_limit_s,
+            "over_limit": drive_s > daily_limit_s or total_s > awake_limit_s,
         })
         day_num += 1
         stop_indices = []
@@ -50,10 +66,11 @@ def split_into_days(
 
     for i in range(stop_count):
         leg_s = legs[i]["duration_s"]
-        addition = leg_s + visit_s
+        drive_next = drive_s + leg_s
+        awake_next = drive_s + visit_total_s + leg_s + visit_s
         # Only ever close a day that already has something in it — a brand-new
         # day always accepts the next stop regardless of overflow.
-        if stop_indices and (drive_s + visit_total_s + addition > daily_limit_s):
+        if stop_indices and (drive_next > daily_limit_s or awake_next > awake_limit_s):
             close_day()
         stop_indices.append(i)
         drive_s += leg_s

@@ -106,6 +106,42 @@ def get_route_multi(locations: list[dict]) -> dict:
     }
 
 
+async def way_ids_for_shape(shape: str) -> set[int]:
+    """Возвращает множество OSM way_id рёбер, по которым проходит маршрут —
+    используется ТОЛЬКО для сравнения "похожести" двух маршрутов по факту
+    общих дорог (round-trip's дедуп непохожих плеч, см. services/stops.py).
+    way_id, не геометрия: параллельные проезжие части одной дороги (разделённая
+    трасса) имеют один way_id, а геометрическое сравнение ложно посчитало бы
+    их разными дорогами.
+
+    `shape` — Valhalla-кодированный polyline (precision 6), тот же формат,
+    в котором Valhalla и отдаёт маршруты (get_route/get_route_alternates) —
+    никакого decode/re-encode не требуется, передаётся как есть в
+    encoded_polyline. shape_match "edge_walk" — у нас точная геометрия от
+    /route, не GPS-трек с шумом, так что Valhalla должна идти строго по ней,
+    не подгонять под ближайшие похожие рёбра.
+
+    Пустой set при любой ошибке (Valhalla недоступна, неожиданный формат
+    ответа) — вызывающий код обязан трактовать это как "сравнение
+    невозможно" и фолбэкнуться на самый быстрый маршрут, не валить всю
+    прокладку из-за упавшего trace_attributes.
+    """
+    payload = {
+        "encoded_polyline": shape,
+        "costing": "auto",
+        "shape_match": "edge_walk",
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{VALHALLA_URL}/trace_attributes", json=payload, timeout=30.0)
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPError:
+        return set()
+
+    return {edge["way_id"] for edge in data.get("edges", []) if "way_id" in edge}
+
+
 async def get_route_alternates(
     origin: tuple[float, float],
     destination: tuple[float, float],

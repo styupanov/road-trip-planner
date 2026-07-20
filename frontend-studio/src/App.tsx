@@ -306,6 +306,14 @@ export default function App() {
 
   // Quiz Actions
   const currentQuestion = QUIZ[step];
+  // Round-trip reuses the "dest" field as the loop's pivot X (see backend
+  // finalize.py's _is_round_trip_from_quiz) — the label/placeholder just
+  // reflects that back to the user; the field itself is unchanged.
+  const isRoundTripAnswers = answers.trip === 'Туда и обратно';
+  const currentQuestionLabel =
+    currentQuestion.k === 'dest' && isRoundTripAnswers ? 'Куда доехать (и вернуться)?' : currentQuestion.q;
+  const currentQuestionPlaceholder =
+    currentQuestion.k === 'dest' && isRoundTripAnswers ? 'куда доехать (и вернуться)' : currentQuestion.ph;
   const currentFieldGeo = currentQuestion.k === 'origin' ? originGeo : currentQuestion.k === 'dest' ? destGeo : null;
   const currentFieldGeoError =
     currentFieldGeo &&
@@ -1040,6 +1048,7 @@ export default function App() {
       categories: mapInterestsToCategories(effectiveAnswers.interests as string[] | undefined),
       max_detour_s: mapDetourToMaxDetourS(effectiveAnswers.detour as string | undefined),
       pace: mapPaceToApiPace(effectiveAnswers.pace as string | undefined),
+      round_trip: effectiveAnswers.trip === 'Туда и обратно',
     })
       .then(result => {
         pendingOptionsRef.current = result.options;
@@ -1141,19 +1150,30 @@ export default function App() {
     const controller = new AbortController();
     routeThroughAbortRef.current = controller;
 
+    // Already in global order (leg1 stops before leg2 stops, per the
+    // backend's offset trick — see find_stops_for_round_trip) even for a
+    // round-trip option, since to_poi_s is what the offset was applied to.
     const orderedStops = stopsList
       .filter(s => stopIds.has(s.id))
       .sort((a, b) => a.to_poi_s - b.to_poi_s);
 
+    const routeThroughReq = isRoundTripAnswers
+      ? {
+          origin: { lat: origin.lat, lon: origin.lng },
+          destination: { lat: dest.lat, lon: dest.lng },
+          stops: [],
+          round_trip: true,
+          leg1_stops: orderedStops.filter(s => s.leg !== 1).map(s => ({ lat: s.lat, lon: s.lon })),
+          leg2_stops: orderedStops.filter(s => s.leg === 1).map(s => ({ lat: s.lat, lon: s.lon })),
+        }
+      : {
+          origin: { lat: origin.lat, lon: origin.lng },
+          destination: { lat: dest.lat, lon: dest.lng },
+          stops: orderedStops.map(s => ({ lat: s.lat, lon: s.lon })),
+        };
+
     setLoadingOptionIndex(optionIndex);
-    postRouteThrough(
-      {
-        origin: { lat: origin.lat, lon: origin.lng },
-        destination: { lat: dest.lat, lon: dest.lng },
-        stops: orderedStops.map(s => ({ lat: s.lat, lon: s.lon })),
-      },
-      controller.signal
-    )
+    postRouteThrough(routeThroughReq, controller.signal)
       .then(result => {
         setRouteThroughByOption(prev => {
           const next = new Map(prev);
@@ -1367,7 +1387,28 @@ export default function App() {
       order: orderByIdFinal.get(s.id) ?? null,
     }));
 
-    const waypoints = [finOrigin, ...finalizedTrip.stops.map(s => ({ lat: s.lat, lng: s.lon })), finDest];
+    // Round-trip: `finDest` is the loop's pivot X (see FinalizedTripResult's
+    // own docstring), not where the trip physically ends — the loop always
+    // closes back at `finOrigin`. X is never itself a stop (see backend's
+    // _parse_active_selection), so it has to be inserted explicitly at the
+    // leg1/leg2 boundary, and the waypoint list has to END at `finOrigin`
+    // again — otherwise splitPathIntoLegs' last segment gets matched against
+    // X's position (roughly mid-path, where the pivot crossing happens)
+    // instead of the path's actual end, truncating the final segment before
+    // it ever reaches back to A.
+    const leg1Stops = finalizedTrip.round_trip ? finalizedTrip.stops.filter(s => s.leg !== 1) : finalizedTrip.stops;
+    const leg2Stops = finalizedTrip.round_trip ? finalizedTrip.stops.filter(s => s.leg === 1) : [];
+    const l1 = leg1Stops.length;
+
+    const waypoints = finalizedTrip.round_trip
+      ? [
+          finOrigin,
+          ...leg1Stops.map(s => ({ lat: s.lat, lng: s.lon })),
+          finDest,
+          ...leg2Stops.map(s => ({ lat: s.lat, lng: s.lon })),
+          finOrigin,
+        ]
+      : [finOrigin, ...finalizedTrip.stops.map(s => ({ lat: s.lat, lng: s.lon })), finDest];
     const legSegments = splitPathIntoLegs(path, waypoints);
     const stopIndexToDay = new Map<number, number>();
     finalizedTrip.days.forEach((day, dayIdx) => {
@@ -1375,10 +1416,26 @@ export default function App() {
     });
     const lastDayIdx = finalizedTrip.days.length - 1;
 
+    // legIdx maps 1:1 onto global stop_indices for one-way (waypoints =
+    // [origin, ...stops, destination]). Round-trip inserts ONE extra
+    // waypoint (X) right after leg1's stops, so every segment from there on
+    // is shifted by 1 — and the hop INTO X itself (legIdx === l1) has no
+    // stop of its own to look up, so it's attributed to whichever day the
+    // pivot crossing falls in (the day containing the last leg1 stop, or
+    // day 1 when leg1 has no stops) — same convention
+    // day_split.split_into_days uses for the merged pivot hop's drive time.
+    const dayIdxForSegment = (legIdx: number): number => {
+      if (!finalizedTrip.round_trip) {
+        return legIdx < finalizedTrip.stops.length ? stopIndexToDay.get(legIdx) ?? lastDayIdx : lastDayIdx;
+      }
+      if (legIdx < l1) return stopIndexToDay.get(legIdx) ?? lastDayIdx;
+      if (legIdx === l1) return stopIndexToDay.get(Math.max(l1 - 1, 0)) ?? lastDayIdx;
+      if (legIdx <= l1 + leg2Stops.length) return stopIndexToDay.get(legIdx - 1) ?? lastDayIdx;
+      return lastDayIdx;
+    };
+
     activeDaySegments = legSegments.map((points, legIdx) => {
-      const dayIdx = legIdx < finalizedTrip.stops.length
-        ? stopIndexToDay.get(legIdx) ?? lastDayIdx
-        : lastDayIdx;
+      const dayIdx = dayIdxForSegment(legIdx);
       // Сворачиваемые дни: dayNumber is the actual day.day (1-based), not the
       // array index — TripMap reports THIS back on segment click, and it has
       // to match what FinalizedView keys its accordion/refs by.
@@ -1644,7 +1701,7 @@ export default function App() {
                         <span style={{ width: `${(step / QUIZ.length) * 100}%` }} />
                       </i>
                     </div>
-                    <div className="q-text">{currentQuestion.q}</div>
+                    <div className="q-text">{currentQuestionLabel}</div>
 
                     <div id="q-body">
                       {currentQuestion.type === 'text' && (
@@ -1652,7 +1709,7 @@ export default function App() {
                           <input
                             className="q-in"
                             id="q-val"
-                            placeholder={currentQuestion.ph}
+                            placeholder={currentQuestionPlaceholder}
                             value={(answers[currentQuestion.k] as string) || ''}
                             onChange={(e) => handleTextAnswerChange(e.target.value)}
                             onBlur={(e) => {

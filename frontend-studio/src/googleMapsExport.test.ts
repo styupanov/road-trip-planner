@@ -7,7 +7,7 @@ import { buildGoogleMapsDayUrl } from './googleMapsExport';
 
 const stop = (id: number, lat: number, lon: number): FinalizedStop => ({
   id, name: `Stop ${id}`, category: 'Nature & Parks', rating: null, review_count: null,
-  lat, lon, detour_s: 0, why: '', tips: null, dates_note: null,
+  lat, lon, detour_s: 0, why: '', tips: null, dates_note: null, leg: null,
 });
 
 const lodging = (placeId: string, lat: number, lon: number): FinalizedLodging => ({

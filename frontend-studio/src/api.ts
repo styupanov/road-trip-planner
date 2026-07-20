@@ -114,6 +114,10 @@ export interface ApiStop {
   to_poi_s: number;
   from_poi_s: number;
   suggested: boolean;
+  // 0 or 1 for a round-trip option's stops (which leg it's on — see the
+  // backend's services.stops.find_stops_for_round_trip); null for a one-way
+  // option, which has no legs to distinguish.
+  leg: number | null;
 }
 
 export interface UnreachablePoi {
@@ -157,7 +161,13 @@ export async function getStops(req: StopsRequest): Promise<StopsResult> {
 export interface RouteThroughRequest {
   origin: { lat: number; lon: number };
   destination: { lat: number; lon: number };
+  // One-way: `stops`, ordered. Round-trip: `round_trip: true` plus
+  // `leg1_stops`/`leg2_stops` instead (destination is the loop's pivot X) —
+  // `stops` stays omitted/empty in that case.
   stops: { lat: number; lon: number }[];
+  round_trip?: boolean;
+  leg1_stops?: { lat: number; lon: number }[];
+  leg2_stops?: { lat: number; lon: number }[];
 }
 
 export interface RouteLeg {
@@ -205,6 +215,8 @@ export interface CompareRoutesRequest {
   alternates?: number;
   radius_m?: number;
   limit?: number;
+  // True treats `destination` as the round trip's pivot X (A->X->A).
+  round_trip?: boolean;
 }
 
 export interface TopStop {
@@ -252,6 +264,7 @@ export async function getCompareRoutes(req: CompareRoutesRequest): Promise<Compa
       alternates: req.alternates ?? 2,
       radius_m: req.radius_m ?? 20000,
       limit: req.limit ?? 50,
+      round_trip: req.round_trip ?? false,
     }),
   });
 
@@ -760,6 +773,9 @@ export interface FinalizedStop {
   why: string;
   tips: string | null;
   dates_note: string | null;
+  // 0 or 1 for a round-trip snapshot's stops (which leg it's on); null for
+  // one-way, or a snapshot finalized before this field existed.
+  leg: number | null;
 }
 
 export interface FinalizedRoute {
@@ -806,6 +822,8 @@ export interface DayPlan {
 
 export interface FinalizedTripResult {
   origin: FinalizedEndpoint;
+  // For round_trip=true, this is the loop's pivot X, NOT where the trip
+  // physically ends — the trip always ends back at `origin`.
   destination: FinalizedEndpoint;
   stops: FinalizedStop[];
   route: FinalizedRoute;
@@ -815,6 +833,8 @@ export interface FinalizedTripResult {
   trip_dates: string | null;
   finalized_at: string;
   is_first_finalize: boolean;
+  // True for an A->X->A loop.
+  round_trip: boolean;
 }
 
 // Self-contained — built entirely from trip_versions.snapshot on the backend,

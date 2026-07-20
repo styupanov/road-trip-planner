@@ -153,12 +153,16 @@ const DayGroupHeader: React.FC<{ day: DayResult; lastStopName: string | null }> 
       )}
     </div>
     {day.over_limit && (
+      // over_limit fires for EITHER of two independent backend ceilings
+      // (day_split.py: drive_s alone vs daily_limit_s, or drive_s+visit_s vs
+      // awake_limit_s) — the flag itself doesn't say which, so the badge
+      // can't claim it's specifically about driving time anymore.
       <span
         className="flex items-center gap-1 text-[9px] uppercase tracking-wide text-[#c05640] font-mono flex-shrink-0"
-        title="Переезд в этот день длиннее заданного лимита вождения"
+        title="Этот день превышает лимит вождения или бодрствования"
       >
         <AlertTriangle size={10} className="flex-shrink-0" />
-        длинный переезд
+        день перегружен
       </span>
     )}
   </div>
