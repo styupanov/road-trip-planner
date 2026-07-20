@@ -41,9 +41,21 @@ export interface TripMapProps {
   // Replaces planRouteLines' active entry with per-day colored segments, once
   // day_split has run for the active option — empty before that (single-color
   // active line renders as usual). Non-active options are never colored by day.
-  activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string }>;
+  // dayNumber is the 1-based day.day this leg belongs to (matches FinalizedView's
+  // day numbering) — only meaningfully clickable in phase 'finalized', see
+  // onSegmentClick, but always present so the type is uniform across phases.
+  activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string; dayNumber: number }>;
   // Small colored badges at each point where the route's day color changes.
   dayBoundaryMarkers: Array<{ position: { lat: number; lng: number }; color: string; label: string }>;
+  // Клик по сегменту карты -> панель (Фаза "сворачиваемые дни"): reports
+  // which day's segment was clicked, regardless of which of its (possibly
+  // several) leg-polylines the user actually clicked — every leg belonging
+  // to the same day already carries that day's number.
+  onSegmentClick?: (dayNumber: number) => void;
+  // Optional reverse highlight (panel hover -> map): the segments whose
+  // dayNumber matches render thicker. Never required — omitted, no segment
+  // is treated as highlighted.
+  highlightedDay?: number | null;
   // Фаза ночёвок: one marker per day that has a chosen overnight — only ever
   // non-empty in phase 'finalized' (a snapshot's picked lodging), never in
   // 'plan' (nothing is chosen yet during the free draft).
@@ -84,9 +96,18 @@ const MapPolyline: React.FC<{
   color?: string;
   opacity?: number;
   weight?: number;
-}> = ({ path, visible, color = '#e8b53f', opacity = 0.9, weight = 3 }) => {
+  onClick?: () => void;
+}> = ({ path, visible, color = '#e8b53f', opacity = 0.9, weight = 3, onClick }) => {
   const map = useMap();
   const polylineRef = useRef<google.maps.Polyline | null>(null);
+  // Ref, not a dependency: onClick is a fresh inline closure on every App.tsx
+  // render (it captures the segment's dayNumber) — routing it through a ref
+  // (same pattern as GoogleSignInButton's onCredentialRef) means the
+  // google.maps.Polyline instance below is only destroyed/recreated when
+  // path/color/weight actually change, never just because the callback's
+  // identity did.
+  const onClickRef = useRef(onClick);
+  onClickRef.current = onClick;
 
   useEffect(() => {
     if (!map || !window.google) return;
@@ -107,8 +128,10 @@ const MapPolyline: React.FC<{
     });
 
     polylineRef.current = polyline;
+    const listener = polyline.addListener('click', () => onClickRef.current?.());
 
     return () => {
+      listener.remove();
       if (polylineRef.current) {
         polylineRef.current.setMap(null);
       }
@@ -319,6 +342,8 @@ export const TripMap: React.FC<TripMapProps> = ({
   activeDaySegments,
   dayBoundaryMarkers,
   lodgingMarkers,
+  onSegmentClick,
+  highlightedDay,
   selectedStopId,
   onSelectStop,
   onClosePopup,
@@ -399,7 +424,11 @@ export const TripMap: React.FC<TripMapProps> = ({
           })}
 
           {/* Day-colored segments of the active route — same 6px weight the active
-              line always had, one color per day (see dayColors.ts). */}
+              line always had (9px when this segment's day is highlighted from the
+              panel, see highlightedDay), one color per day (see dayColors.ts).
+              Clickable when onSegmentClick is given (phase 'finalized') — every
+              leg of a multi-leg day reports the SAME dayNumber, so it doesn't
+              matter which of a day's segments gets clicked. */}
           {activeDaySegments.map((segment, idx) => (
             <MapPolyline
               key={`day-segment-${idx}`}
@@ -407,7 +436,8 @@ export const TripMap: React.FC<TripMapProps> = ({
               visible={true}
               color={segment.color}
               opacity={1.0}
-              weight={6}
+              weight={segment.dayNumber === highlightedDay ? 9 : 6}
+              onClick={onSegmentClick ? () => onSegmentClick(segment.dayNumber) : undefined}
             />
           ))}
 

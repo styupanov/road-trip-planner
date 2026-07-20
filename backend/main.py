@@ -751,12 +751,25 @@ class FinalizedDayOut(BaseModel):
     lodging: FinalizedLodgingOut | None
 
 
+class DayPlanOut(BaseModel):
+    # None when the quiz's day count wasn't provided — nothing to compare
+    # the split against, not even an unknown "false" (same reasoning DayOut's
+    # old fits_plan field used, before this replaced it — see finalize.py).
+    requested: int | None
+    actual: int
+    flexible: bool
+    # True only when actual > requested AND flexible is false — a flexible
+    # trip going over its requested length is expected, not a warning.
+    over_plan: bool
+
+
 class FinalizedTripOut(BaseModel):
     origin: FinalizedEndpointOut
     destination: FinalizedEndpointOut
     stops: list[FinalizedStopOut]
     route: FinalizedRouteOut
     days: list[FinalizedDayOut]
+    day_plan: DayPlanOut
     enrichment: FinalizedEnrichmentOut
     trip_dates: str | None
     finalized_at: str

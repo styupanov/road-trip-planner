@@ -1,6 +1,6 @@
-import React from 'react';
-import { Info, Calendar, CheckCircle2, BedDouble, ExternalLink, Navigation } from 'lucide-react';
-import { FinalizedLodging, FinalizedStop, FinalizedTripResult } from '../api';
+import React, { forwardRef, useImperativeHandle, useRef, useState } from 'react';
+import { AlertTriangle, ChevronDown, ChevronRight, Info, Calendar, CheckCircle2, BedDouble, ExternalLink, Navigation } from 'lucide-react';
+import { DayPlan, FinalizedLodging, FinalizedStop, FinalizedTripResult } from '../api';
 import { formatDuration, formatDaysRu } from '../format';
 import { dayColor } from '../dayColors';
 import { buildGoogleMapsDayUrl } from '../googleMapsExport';
@@ -10,6 +10,18 @@ export interface FinalizedViewProps {
   selectedStopId: number | null;
   onSelectStop: (id: number) => void;
   onEditDraft: () => void;
+  // Reverse highlight (map segment hover -> panel), optional per spec.
+  onDayHover?: (day: number | null) => void;
+}
+
+// Imperative, not a prop, on purpose: expandedDays/activeDay are FinalizedView's
+// OWN local state (per spec — not lifted to App.tsx, not in snapshot/draft_state),
+// but a map segment click originates in a SIBLING component (MapComponent) that
+// App.tsx also renders. A ref exposing "make this day visible" is the standard
+// way to let a sibling's event reach into a component's local state without
+// lifting that state up just to serve one cross-component interaction.
+export interface FinalizedViewHandle {
+  focusDay: (dayNumber: number) => void;
 }
 
 const FinalizedStopCard: React.FC<{
@@ -86,6 +98,33 @@ const LodgingLine: React.FC<{ lodging: FinalizedLodging }> = ({ lodging }) => (
   </a>
 );
 
+// day_plan is derived server-side from the FINISHED snapshot.days, not from
+// get_route_detail's own fits_plan (which only ever existed in the no-lodging
+// path and never made it into the snapshot) — see finalize.py. This just
+// renders it: neutral by default, warning-accent (same style as a day's own
+// over_limit badge) only when over_plan is true, which the backend already
+// guarantees is false whenever flexible is true — no flexible-check needed
+// here, over_plan alone is the single source of truth for the accent.
+const DayPlanLine: React.FC<{ dayPlan: DayPlan }> = ({ dayPlan }) => {
+  const { requested, actual, over_plan } = dayPlan;
+  const overBy = requested != null ? actual - requested : 0;
+
+  return (
+    <div
+      className={`flex items-start gap-1.5 text-[11px] mt-1.5 ${
+        over_plan ? 'text-[#c05640]' : 'text-[#8b9199]'
+      }`}
+    >
+      {over_plan && <AlertTriangle size={12} className="flex-shrink-0 mt-0.5" />}
+      <span className="leading-snug">
+        Поездка займёт {formatDaysRu(actual)}
+        {requested != null && requested !== actual && ` — вы планировали ${formatDaysRu(requested)}`}
+        {over_plan && <span className="font-semibold"> (на {formatDaysRu(overBy)} больше плана)</span>}
+      </span>
+    </div>
+  );
+};
+
 const formatFinalizedAt = (iso: string): string => {
   try {
     return new Date(iso).toLocaleDateString('ru-RU', {
@@ -99,8 +138,37 @@ const formatFinalizedAt = (iso: string): string => {
 // Read-only counterpart to PlanPanel — renders a finalized trip_versions
 // snapshot exactly as it was locked in, no checkboxes, no option tabs (a
 // finalized trip has exactly one route, not several alternatives to compare).
-export const FinalizedView: React.FC<FinalizedViewProps> = ({ trip, selectedStopId, onSelectStop, onEditDraft }) => {
+export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>(({
+  trip, selectedStopId, onSelectStop, onEditDraft, onDayHover,
+}, ref) => {
   const orderById = new Map(trip.stops.map((s, i) => [s.id, i + 1]));
+
+  // Multi-accordion: any number of days can be expanded at once, toggling
+  // one never affects the others. Day 1 open by default, everything else
+  // collapsed — matches how a finalized trip is actually read (start with
+  // tomorrow's plan, open the rest as needed).
+  const [expandedDays, setExpandedDays] = useState<Set<number>>(() => new Set([1]));
+  // "Last day clicked on the map" — an accent, not a second expand/collapse
+  // flag (see FinalizedViewHandle's own comment on why this is imperative).
+  const [activeDay, setActiveDay] = useState<number | null>(null);
+  const dayHeaderRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+
+  const toggleDay = (dayNumber: number) => {
+    setExpandedDays((prev) => {
+      const next = new Set(prev);
+      if (next.has(dayNumber)) next.delete(dayNumber);
+      else next.add(dayNumber);
+      return next;
+    });
+  };
+
+  useImperativeHandle(ref, () => ({
+    focusDay: (dayNumber: number) => {
+      setExpandedDays((prev) => (prev.has(dayNumber) ? prev : new Set(prev).add(dayNumber)));
+      setActiveDay(dayNumber);
+      dayHeaderRefs.current.get(dayNumber)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    },
+  }));
 
   return (
     <aside className="w-[min(560px,40vw)] h-full flex flex-col bg-[#14171a] border-l border-black overflow-hidden">
@@ -118,6 +186,7 @@ export const FinalizedView: React.FC<FinalizedViewProps> = ({ trip, selectedStop
           {trip.stops.length} остановок · {formatDaysRu(trip.days.length)}
           {trip.trip_dates ? ` · ${trip.trip_dates}` : ''}
         </div>
+        <DayPlanLine dayPlan={trip.day_plan} />
       </div>
 
       <div className="flex-1 overflow-y-auto p-2.5 space-y-1.5">
@@ -141,16 +210,36 @@ export const FinalizedView: React.FC<FinalizedViewProps> = ({ trip, selectedStop
           const dayStops = day.stop_indices
             .map((idx) => trip.stops[idx])
             .filter((s): s is FinalizedStop => s != null);
-          const lastStopName = dayStops.length > 0 ? dayStops[dayStops.length - 1].name : null;
           const prevDayLodging = dayIdx > 0 ? trip.days[dayIdx - 1].lodging : null;
           const mapsUrl = buildGoogleMapsDayUrl(
             day, dayStops, prevDayLodging, { lat: trip.origin.lat, lon: trip.origin.lon }
           );
+          const isExpanded = expandedDays.has(day.day);
+          const isActive = activeDay === day.day;
 
           return (
-            <div key={day.day}>
-              <div className="flex items-center justify-between gap-2 px-0.5 pt-1 pb-1.5">
+            <div
+              key={day.day}
+              className={`rounded transition-colors ${isActive ? 'bg-[#e8b53f]/5 ring-1 ring-[#e8b53f]/40' : ''}`}
+              onMouseEnter={() => onDayHover?.(day.day)}
+              onMouseLeave={() => onDayHover?.(null)}
+            >
+              <button
+                type="button"
+                ref={(el) => {
+                  if (el) dayHeaderRefs.current.set(day.day, el);
+                  else dayHeaderRefs.current.delete(day.day);
+                }}
+                onClick={() => toggleDay(day.day)}
+                className="w-full flex items-center justify-between gap-2 px-0.5 pt-1 pb-1.5 text-left cursor-pointer"
+                aria-expanded={isExpanded}
+              >
                 <div className="flex items-baseline gap-1.5 min-w-0">
+                  {isExpanded ? (
+                    <ChevronDown size={13} className="text-[#8b9199] flex-shrink-0" />
+                  ) : (
+                    <ChevronRight size={13} className="text-[#8b9199] flex-shrink-0" />
+                  )}
                   <span
                     className="w-2.5 h-2.5 rounded-full flex-shrink-0"
                     style={{ backgroundColor: dayColor(day.day - 1) }}
@@ -161,33 +250,41 @@ export const FinalizedView: React.FC<FinalizedViewProps> = ({ trip, selectedStop
                   <span className="text-[11px] font-mono text-[#8b9199] flex-shrink-0">
                     · ~{formatDuration(day.total_s)}
                   </span>
-                  {lastStopName && (
-                    <span className="text-[10px] text-[#5a5f66] truncate">· ≈ район {lastStopName}</span>
+                  <span className="text-[10px] text-[#5a5f66] flex-shrink-0">
+                    · {dayStops.length} {dayStops.length === 1 ? 'остановка' : dayStops.length < 5 ? 'остановки' : 'остановок'}
+                  </span>
+                  {day.lodging && (
+                    <span className="text-[10px] text-[#16a085] truncate">· 🛏 {day.lodging.name}</span>
                   )}
                 </div>
-              </div>
-              <div className="space-y-1.5">
-                {dayStops.map((stop) => (
-                  <FinalizedStopCard
-                    key={stop.id}
-                    stop={stop}
-                    isSelected={selectedStopId === stop.id}
-                    order={orderById.get(stop.id) ?? 0}
-                    onSelectStop={onSelectStop}
-                  />
-                ))}
-              </div>
-              {day.lodging && <LodgingLine lodging={day.lodging} />}
-              {mapsUrl && (
-                <a
-                  href={mapsUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 mt-1.5 rounded text-[11px] font-medium text-[#8b9199] border border-[#2c3138] hover:border-[#3a4048] hover:text-[#f2ede3] transition-colors"
-                >
-                  <Navigation size={12} className="flex-shrink-0" />
-                  Открыть день в Google Maps
-                </a>
+              </button>
+
+              {isExpanded && (
+                <div className="pb-1.5">
+                  <div className="space-y-1.5">
+                    {dayStops.map((stop) => (
+                      <FinalizedStopCard
+                        key={stop.id}
+                        stop={stop}
+                        isSelected={selectedStopId === stop.id}
+                        order={orderById.get(stop.id) ?? 0}
+                        onSelectStop={onSelectStop}
+                      />
+                    ))}
+                  </div>
+                  {day.lodging && <LodgingLine lodging={day.lodging} />}
+                  {mapsUrl && (
+                    <a
+                      href={mapsUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center justify-center gap-1.5 px-2.5 py-1.5 mt-1.5 rounded text-[11px] font-medium text-[#8b9199] border border-[#2c3138] hover:border-[#3a4048] hover:text-[#f2ede3] transition-colors"
+                    >
+                      <Navigation size={12} className="flex-shrink-0" />
+                      Открыть день в Google Maps
+                    </a>
+                  )}
+                </div>
               )}
             </div>
           );
@@ -228,4 +325,6 @@ export const FinalizedView: React.FC<FinalizedViewProps> = ({ trip, selectedStop
       </div>
     </aside>
   );
-};
+});
+
+FinalizedView.displayName = 'FinalizedView';

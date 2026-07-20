@@ -549,6 +549,25 @@ async def _build_finalized_snapshot(
             } if lodging else None,
         })
 
+    # How the day-split ACTUALLY came out vs what the quiz asked for —
+    # computed HERE, from the finished snapshot_days, not inside
+    # get_route_detail/day_split. That's deliberate: get_route_detail's own
+    # fits_plan only exists in the no-lodging branch above (and is never
+    # read past this point — _build_route_detail_with_lodging doesn't even
+    # accept planned_days/flexible_days as arguments), so it can't be the
+    # source of truth for a feature that has to work the same way regardless
+    # of whether lodging was picked. len(snapshot_days) is the one number
+    # that's always available, from either path, after the real day-split
+    # (Valhalla-boundary-driven or Google-fixed-boundary) has already run.
+    actual_days = len(snapshot_days)
+    over_plan = planned_days is not None and actual_days > planned_days and not flexible_days
+    day_plan = {
+        "requested": planned_days,
+        "actual": actual_days,
+        "flexible": flexible_days,
+        "over_plan": over_plan,
+    }
+
     return {
         "origin": {"name": trip["origin_name"], "lat": origin[0], "lon": origin[1]},
         "destination": {"name": trip["destination_name"], "lat": destination[0], "lon": destination[1]},
@@ -560,6 +579,7 @@ async def _build_finalized_snapshot(
             "legs": route_detail["legs"],
         },
         "days": snapshot_days,
+        "day_plan": day_plan,
         "enrichment": {
             "overview": enrich_result["overview"],
             "warnings": enrich_result["warnings"],

@@ -21,7 +21,7 @@ import { PlanPanel, RouteThroughSummary } from './components/PlanPanel';
 import { DateModal } from './components/DateModal';
 import { FinalizeGateModal } from './components/FinalizeGateModal';
 import { FinalizeProgress } from './components/FinalizeProgress';
-import { FinalizedView } from './components/FinalizedView';
+import { FinalizedView, FinalizedViewHandle } from './components/FinalizedView';
 import { WelcomeModal } from './components/WelcomeModal';
 import { LodgingSelectionModal } from './components/LodgingSelectionModal';
 
@@ -193,6 +193,21 @@ export default function App() {
   // draft_state/buildDraftPayload: it's spent the moment finalize succeeds
   // or fails, never something to restore into a later session.
   const [selectedLodging, setSelectedLodging] = useState<SelectedLodging[] | null>(null);
+
+  // Сворачиваемые дни в FinalizedView: expandedDays/activeDay live INSIDE
+  // FinalizedView (its own local state, not lifted here, not in snapshot/
+  // draft_state) — this ref is only the channel for a map segment click (a
+  // sibling component's event) to reach into that local state, see
+  // FinalizedViewHandle's own comment.
+  const finalizedViewRef = useRef<FinalizedViewHandle>(null);
+  const handleMapSegmentClick = (dayNumber: number) => {
+    finalizedViewRef.current?.focusDay(dayNumber);
+  };
+  // Reverse highlight (optional): which day is currently hovered IN the
+  // panel, so the map can render that day's segments thicker. Lives here
+  // (not in FinalizedView) because the map's rendering data is already
+  // computed in this component, not in FinalizedView.
+  const [hoveredMapDay, setHoveredMapDay] = useState<number | null>(null);
 
   // Auth state (Фаза 2) — who the CURRENT session is linked to, if anyone.
   // Fetched once on mount via getMe(); updated in place by
@@ -1324,7 +1339,7 @@ export default function App() {
   //   never decodeShape (precision 6, Valhalla-only).
   let planRouteLinesForMap: Array<{ points: { lat: number; lng: number }[]; isActive: boolean }>;
   let planMarkersForMap: Array<{ stop: ApiStop; included: boolean; order: number | null }>;
-  let activeDaySegments: Array<{ points: { lat: number; lng: number }[]; color: string }> = [];
+  let activeDaySegments: Array<{ points: { lat: number; lng: number }[]; color: string; dayNumber: number }> = [];
   let dayBoundaryMarkersForMap: Array<{ position: { lat: number; lng: number }; color: string; label: string }> = [];
   // Фаза ночёвок: only ever populated for 'finalized' — nothing is chosen
   // yet during the free draft.
@@ -1364,7 +1379,10 @@ export default function App() {
       const dayIdx = legIdx < finalizedTrip.stops.length
         ? stopIndexToDay.get(legIdx) ?? lastDayIdx
         : lastDayIdx;
-      return { points, color: dayColor(dayIdx) };
+      // Сворачиваемые дни: dayNumber is the actual day.day (1-based), not the
+      // array index — TripMap reports THIS back on segment click, and it has
+      // to match what FinalizedView keys its accordion/refs by.
+      return { points, color: dayColor(dayIdx), dayNumber: finalizedTrip.days[dayIdx]?.day ?? dayIdx + 1 };
     });
 
     dayBoundaryMarkersForMap = finalizedTrip.days.slice(1).map((day) => {
@@ -1436,7 +1454,10 @@ export default function App() {
         const dayIdx = legIdx < includedSortedForMap.length
           ? stopIndexToDay.get(legIdx) ?? lastDayIdx
           : lastDayIdx;
-        return { points, color: dayColor(dayIdx) };
+        // dayNumber unused in 'plan' (no onSegmentClick wired for this phase,
+        // no accordion to report to) — present only so the type matches the
+        // 'finalized' branch above.
+        return { points, color: dayColor(dayIdx), dayNumber: activeDetailForMap.days[dayIdx]?.day ?? dayIdx + 1 };
       });
 
       dayBoundaryMarkersForMap = activeDetailForMap.days.slice(1).map((day) => {
@@ -1849,6 +1870,8 @@ export default function App() {
               activeDaySegments={activeDaySegments}
               dayBoundaryMarkers={dayBoundaryMarkersForMap}
               lodgingMarkers={lodgingMarkersForMap}
+              onSegmentClick={handleMapSegmentClick}
+              highlightedDay={hoveredMapDay}
               selectedStopId={selectedStopId}
               onSelectStop={handleSelectStop}
               onClosePopup={() => setSelectedStopId(null)}
@@ -1876,10 +1899,12 @@ export default function App() {
 
           {phase === 'finalized' && finalizedTrip && (
             <FinalizedView
+              ref={finalizedViewRef}
               trip={finalizedTrip}
               selectedStopId={selectedStopId}
               onSelectStop={handleSelectStop}
               onEditDraft={handleEditDraftFromFinalized}
+              onDayHover={setHoveredMapDay}
             />
           )}
         </main>

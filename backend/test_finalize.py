@@ -62,13 +62,18 @@ def _fake_stop(id_: int, to_poi_s: int) -> dict:
     }
 
 
-async def _make_trip_with_draft(conn, user_id: uuid.UUID) -> uuid.UUID:
+async def _make_trip_with_draft(conn, user_id: uuid.UUID, quiz_answers: dict | None = None) -> uuid.UUID:
     """A trip in the shape process_finalization's real pipeline expects to
     read: an active option with three stops (two included, out of to_poi_s
     order on purpose — the pipeline must sort them; one excluded, to prove
     it's filtered out), plus quiz_answers driving daily_limit_s/planned_days/
     flexible_days. No trip_dates in quiz_answers — matches production today,
-    where nothing writes it there yet (see finalize.py's docstring)."""
+    where nothing writes it there yet (see finalize.py's docstring).
+
+    quiz_answers defaults to days=3/flexible_days=True (the original fixture,
+    still used by tests that don't care about day_plan specifics) — pass an
+    override for tests that need a specific requested/flexible combination.
+    """
     stop_included_a = _fake_stop(1, to_poi_s=3600)  # later along the route...
     stop_included_b = _fake_stop(2, to_poi_s=1800)  # ...but listed first here
     stop_excluded = _fake_stop(3, to_poi_s=2700)
@@ -98,7 +103,8 @@ async def _make_trip_with_draft(conn, user_id: uuid.UUID) -> uuid.UUID:
         "routeOrigin": {"lat": 39.7392, "lng": -104.9903},
         "routeDest": {"lat": 37.2753, "lng": -107.8801},
     }
-    quiz_answers = {"drive": "до 4 ч", "days": 3, "flexible_days": True}
+    if quiz_answers is None:
+        quiz_answers = {"drive": "до 4 ч", "days": 3, "flexible_days": True}
 
     row = await conn.fetchrow(
         """
@@ -411,6 +417,10 @@ async def test_process_finalization_completes_with_real_pipeline(cleanup):
         # finalize.py's snapshot_days comment).
         expected_days = [{**d, "lodging": None} for d in _FAKE_ROUTE_DETAIL["days"]]
         assert snapshot["days"] == expected_days
+        # quiz_answers here is days=3/flexible_days=True (see _make_trip_with_draft's
+        # default), actual is 1 day (_FAKE_ROUTE_DETAIL) — under, not over, so
+        # over_plan is False regardless of flexible.
+        assert snapshot["day_plan"] == {"requested": 3, "actual": 1, "flexible": True, "over_plan": False}
         assert snapshot["enrichment"] == {
             "overview": _FAKE_ENRICH_RESULT["overview"],
             "warnings": _FAKE_ENRICH_RESULT["warnings"],
@@ -686,3 +696,90 @@ async def test_process_finalization_with_selected_lodging_inserts_waypoints(clea
         assert balance == 0
         project_status = await conn.fetchval("SELECT status FROM app.trip_projects WHERE id = $1", trip_id)
         assert project_status == "finalized"
+
+
+# --- day_plan: derived from finished snapshot.days, not get_route_detail ---
+# fits_plan (see finalize.py's docstring on why it's unused for this) is
+# never touched here — quiz_answers["days"]/["flexible_days"] vs
+# len(snapshot["days"]) is the only thing exercised.
+
+_TWO_DAY_ROUTE_DETAIL = {
+    **_FAKE_ROUTE_DETAIL,
+    "days": [
+        {"day": 1, "stop_indices": [0], "drive_s": 18000, "visit_s": 3600, "total_s": 21600, "over_limit": False},
+        {"day": 2, "stop_indices": [1], "drive_s": 18000, "visit_s": 3600, "total_s": 21600, "over_limit": False},
+    ],
+}
+
+
+async def test_day_plan_over_plan_when_actual_exceeds_requested_and_not_flexible(cleanup):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        trip_id = await _make_trip_with_draft(conn, user_id, quiz_answers={"drive": "до 4 ч", "days": 1, "flexible_days": False})
+    cleanup["users"].append(user_id)
+    cleanup["trip_projects"].append(trip_id)
+
+    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    with patch("directions.get_route_detail", new=AsyncMock(return_value=_TWO_DAY_ROUTE_DETAIL)), \
+         patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
+        await finalize.process_finalization(job.id)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        job_row = await conn.fetchrow("SELECT trip_version_id FROM app.finalization_jobs WHERE id = $1", job.id)
+        snapshot = json.loads(await conn.fetchval(
+            "SELECT snapshot FROM app.trip_versions WHERE id = $1", job_row["trip_version_id"]
+        ))
+
+    assert snapshot["day_plan"] == {"requested": 1, "actual": 2, "flexible": False, "over_plan": True}
+
+
+async def test_day_plan_flexible_suppresses_over_plan(cleanup):
+    """Same 1-requested/2-actual mismatch as above, but flexible_days=True —
+    the user already said +/-1 day is fine, so over_plan must stay False."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        trip_id = await _make_trip_with_draft(conn, user_id, quiz_answers={"drive": "до 4 ч", "days": 1, "flexible_days": True})
+    cleanup["users"].append(user_id)
+    cleanup["trip_projects"].append(trip_id)
+
+    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    with patch("directions.get_route_detail", new=AsyncMock(return_value=_TWO_DAY_ROUTE_DETAIL)), \
+         patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
+        await finalize.process_finalization(job.id)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        job_row = await conn.fetchrow("SELECT trip_version_id FROM app.finalization_jobs WHERE id = $1", job.id)
+        snapshot = json.loads(await conn.fetchval(
+            "SELECT snapshot FROM app.trip_versions WHERE id = $1", job_row["trip_version_id"]
+        ))
+
+    assert snapshot["day_plan"] == {"requested": 1, "actual": 2, "flexible": True, "over_plan": False}
+
+
+async def test_day_plan_requested_null_when_days_not_answered(cleanup):
+    """No "days" key in quiz_answers at all (user never reached/answered that
+    quiz step) -> requested=None, over_plan always False regardless of actual."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        trip_id = await _make_trip_with_draft(conn, user_id, quiz_answers={"drive": "до 4 ч"})
+    cleanup["users"].append(user_id)
+    cleanup["trip_projects"].append(trip_id)
+
+    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    with patch("directions.get_route_detail", new=AsyncMock(return_value=_TWO_DAY_ROUTE_DETAIL)), \
+         patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
+        await finalize.process_finalization(job.id)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        job_row = await conn.fetchrow("SELECT trip_version_id FROM app.finalization_jobs WHERE id = $1", job.id)
+        snapshot = json.loads(await conn.fetchval(
+            "SELECT snapshot FROM app.trip_versions WHERE id = $1", job_row["trip_version_id"]
+        ))
+
+    assert snapshot["day_plan"] == {"requested": None, "actual": 2, "flexible": False, "over_plan": False}

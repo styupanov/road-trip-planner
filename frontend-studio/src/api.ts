@@ -795,12 +795,22 @@ export interface FinalizedDay extends DayResult {
   lodging: FinalizedLodging | null;
 }
 
+export interface DayPlan {
+  // null when the quiz's day count wasn't provided.
+  requested: number | null;
+  actual: number;
+  flexible: boolean;
+  // True only when actual > requested AND flexible is false.
+  over_plan: boolean;
+}
+
 export interface FinalizedTripResult {
   origin: FinalizedEndpoint;
   destination: FinalizedEndpoint;
   stops: FinalizedStop[];
   route: FinalizedRoute;
   days: FinalizedDay[];
+  day_plan: DayPlan;
   enrichment: FinalizedEnrichment;
   trip_dates: string | null;
   finalized_at: string;

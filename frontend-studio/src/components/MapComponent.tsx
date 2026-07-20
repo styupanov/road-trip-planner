@@ -19,11 +19,17 @@ interface MapComponentProps {
   planMarkers: PlanMapMarker[];
   // Day-colored replacement for the active option's line in planRouteLines —
   // only non-empty once /detail-route has run for it (see App.tsx comment).
-  activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string }>;
+  activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string; dayNumber: number }>;
   dayBoundaryMarkers: Array<{ position: { lat: number; lng: number }; color: string; label: string }>;
   // Фаза ночёвок: only ever populated in phase 'finalized' (a snapshot's
   // chosen lodging) — App.tsx passes [] for every other phase.
   lodgingMarkers: Array<{ position: { lat: number; lng: number }; name: string }>;
+  // Сворачиваемые дни (Фаза 3, показ): clicking a day's route segment on the
+  // map expands/scrolls to it in FinalizedView. Only meaningful in phase
+  // 'finalized' — passed through unconditionally, harmless elsewhere since
+  // activeDaySegments itself is gated to showOverlay below.
+  onSegmentClick?: (dayNumber: number) => void;
+  highlightedDay?: number | null;
   selectedStopId: number | null;
   onSelectStop: (id: number) => void;
   onClosePopup: () => void;
@@ -45,6 +51,8 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   activeDaySegments,
   dayBoundaryMarkers,
   lodgingMarkers,
+  onSegmentClick,
+  highlightedDay,
   selectedStopId,
   onSelectStop,
   onClosePopup,
@@ -72,6 +80,8 @@ export const MapComponent: React.FC<MapComponentProps> = ({
         activeDaySegments={showOverlay ? activeDaySegments : []}
         dayBoundaryMarkers={showOverlay ? dayBoundaryMarkers : []}
         lodgingMarkers={showOverlay ? lodgingMarkers : []}
+        onSegmentClick={onSegmentClick}
+        highlightedDay={highlightedDay}
         selectedStopId={selectedStopId}
         onSelectStop={onSelectStop}
         onClosePopup={onClosePopup}
