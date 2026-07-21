@@ -712,6 +712,11 @@ export interface FinalizeResult {
   error: string | null;
 }
 
+export interface LodgingOptionsForDay {
+  day: number;
+  options: LodgingOption[];
+}
+
 // idempotencyKey is generated ONCE when the confirm screen opens (App.tsx),
 // not per click/retry — the backend's start_finalization treats a replayed
 // key as "return the existing job", so retrying a failed request with the
@@ -719,14 +724,21 @@ export interface FinalizeResult {
 // double charge. selectedLodging is null when the user skipped the picker
 // (or it was never shown, e.g. a 1-day trip) — the route then has no
 // lodging waypoints at all, same as before this feature existed.
+// lodgingOptionsByDay is the SAME data the picker showed (from
+// postFinalizePreview, still in App.tsx's state at this point) — forwarded
+// purely so the finalized snapshot can show every option on the map, not
+// just the one selected; the backend never re-fetches Places for this.
 export async function postFinalizeTrip(
-  tripId: string, idempotencyKey: string, selectedLodging: SelectedLodging[] | null
+  tripId: string,
+  idempotencyKey: string,
+  selectedLodging: SelectedLodging[] | null,
+  lodgingOptionsByDay: LodgingOptionsForDay[] | null = null,
 ): Promise<FinalizeResult> {
   const res = await fetch(`${API_URL}/trips/${tripId}/finalize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
     credentials: 'include',
-    body: JSON.stringify({ selected_lodging: selectedLodging }),
+    body: JSON.stringify({ selected_lodging: selectedLodging, lodging_options_by_day: lodgingOptionsByDay }),
   });
 
   if (!res.ok) {
@@ -804,11 +816,30 @@ export interface FinalizedLodging {
   vicinity: string | null;
 }
 
+// Every candidate shown for this night in the free preview picker, selected
+// one included (see finalize.py's _sanitize_lodging_options_by_day) — [] for
+// a trip finalized before this field existed, or one where the frontend
+// never forwarded lodging_options_by_day. Same field set as LodgingOption
+// (the preview one) plus `selected`.
+export interface FinalizedLodgingOption {
+  place_id: string;
+  name: string;
+  lat: number;
+  lon: number;
+  rating: number | null;
+  user_ratings_total: number | null;
+  price_level: number | null;
+  vicinity: string | null;
+  maps_url: string;
+  selected: boolean;
+}
+
 // Own shape rather than reusing DayResult (which the free draft's day
 // grouping also uses) — a finalized day always carries a lodging field
 // (an object or null), a concept the free draft never has.
 export interface FinalizedDay extends DayResult {
   lodging: FinalizedLodging | null;
+  lodging_options: FinalizedLodgingOption[];
 }
 
 export interface DayPlan {

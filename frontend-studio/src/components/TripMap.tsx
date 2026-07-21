@@ -17,11 +17,44 @@ import { dayColor } from '../dayColors';
 // this offset stops being visually significant.
 const STOP_LABEL_MIN_ZOOM = 9;
 
+// Single z-order hierarchy for every AdvancedMarker layer on this map (higher
+// = drawn on top). Without an explicit zIndex, Google Maps falls back to its
+// own collision heuristics — not deterministic between renders, which is
+// exactly why overlapping stop/endpoint markers used to flip which one sat
+// on top from one render to the next. Named constants, not magic numbers at
+// each call site, so the ordering lives in ONE place; steps of 10 leave room
+// for a future modifier within a layer without renumbering everything else.
+// Polylines (google.maps.Polyline) are a completely separate rendering
+// system and never participate in this — see MapPolyline, untouched.
+const Z_STOP_UNSELECTED = 10;
+const Z_STOP_SELECTED = 20;
+const Z_DAY_BADGE = 30;
+const Z_ENDPOINT = 40;
+const Z_LODGING_UNSELECTED = 50;
+const Z_LODGING_SELECTED = 60;
+
 export interface PlanMapMarker {
   stop: ApiStop;
   included: boolean;
   // 1-based position among included stops, in route order; null when excluded
   order: number | null;
+}
+
+export interface LodgingMapMarker {
+  position: { lat: number; lng: number };
+  name: string;
+  placeId: string;
+  rating: number | null;
+  userRatingsTotal: number | null;
+  priceLevel: number | null;
+  vicinity: string | null;
+  mapsUrl: string;
+  // true for the night's chosen lodging — rendered bright/on-top; false for
+  // an unpicked candidate (see finalize.py's lodging_options) — rendered
+  // muted/underneath. Old snapshots without lodging_options only ever
+  // produce selected:true markers (App.tsx falls back to the single
+  // `lodging` field), so this degrades cleanly.
+  selected: boolean;
 }
 
 export interface TripMapProps {
@@ -56,12 +89,15 @@ export interface TripMapProps {
   // dayNumber matches render thicker. Never required — omitted, no segment
   // is treated as highlighted.
   highlightedDay?: number | null;
-  // Фаза ночёвок: one marker per day that has a chosen overnight — only ever
-  // non-empty in phase 'finalized' (a snapshot's picked lodging), never in
-  // 'plan' (nothing is chosen yet during the free draft).
-  lodgingMarkers: Array<{ position: { lat: number; lng: number }; name: string }>;
+  // Фаза ночёвок: one marker per lodging option shown for a night (selected
+  // AND unpicked candidates) — only ever non-empty in phase 'finalized' (a
+  // snapshot's lodging data), never in 'plan' (nothing is chosen yet during
+  // the free draft).
+  lodgingMarkers: LodgingMapMarker[];
   selectedStopId: number | null;
   onSelectStop: (id: number) => void;
+  selectedLodgingPlaceId: string | null;
+  onSelectLodging: (placeId: string) => void;
   // Closes whatever popup is open — plain map click or a different marker click.
   onClosePopup: () => void;
   onToggleStop: (id: number) => void;
@@ -71,6 +107,10 @@ export interface TripMapProps {
   // day segments, stop selection for panning) renders exactly the same as
   // 'plan'. Defaults false so every existing 'plan'-phase caller is unchanged.
   readOnly?: boolean;
+  // Day isolation (finalized map): true while a single day is isolated —
+  // see MapController's own comment for why this suppresses autofit.
+  // Defaults false so every existing caller (nothing isolated) is unaffected.
+  isolatedActive?: boolean;
 }
 
 // Route-line color — a rich, saturated blue distinct from the endpoint-marker
@@ -154,6 +194,7 @@ const EndpointMarker: React.FC<{
   <AdvancedMarker
     position={position}
     draggable={!readOnly}
+    zIndex={Z_ENDPOINT}
     onDragEnd={(e) => {
       if (!readOnly && e.latLng) {
         onDragEnd(e.latLng.lat(), e.latLng.lng());
@@ -274,6 +315,43 @@ const StopPopup: React.FC<{
   );
 };
 
+// Popup shown for a lodging marker (selected or a candidate) — mirrors
+// StopPopup's layout/typography, no checkbox (lodging on a finalized trip
+// is never editable), plus a maps_url link like the day export buttons use.
+const LodgingPopup: React.FC<{
+  marker: LodgingMapMarker;
+  onClose: () => void;
+}> = ({ marker, onClose }) => (
+  <InfoWindow position={marker.position} onCloseClick={onClose}>
+    <div style={{ color: '#14171a', minWidth: '200px', maxWidth: '240px' }}>
+      <div style={{ fontSize: '10px', textTransform: 'uppercase', color: '#6c727a', marginBottom: '4px' }}>
+        {marker.selected ? 'Выбранная ночёвка' : 'Вариант ночёвки'}
+      </div>
+      <div style={{ fontSize: '13px', fontWeight: 600, marginBottom: '4px' }}>{marker.name}</div>
+      <div style={{ fontSize: '12px', color: '#6c727a', marginBottom: '2px' }}>
+        {marker.rating != null ? `★ ${marker.rating.toFixed(1)}` : 'без рейтинга'}
+        {marker.userRatingsTotal != null ? ` · ${marker.userRatingsTotal} отзывов` : ''}
+      </div>
+      {marker.priceLevel != null && (
+        <div style={{ fontSize: '12px', color: '#6c727a', marginBottom: '2px' }}>
+          {'$'.repeat(Math.max(1, marker.priceLevel))}
+        </div>
+      )}
+      {marker.vicinity && (
+        <div style={{ fontSize: '11px', color: '#6c727a', marginBottom: '4px' }}>{marker.vicinity}</div>
+      )}
+      <a
+        href={marker.mapsUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        style={{ fontSize: '11px', color: '#c05640', fontWeight: 600 }}
+      >
+        Открыть в Google Maps
+      </a>
+    </div>
+  </InfoWindow>
+);
+
 // Helper component to handle map fit/pan/zoom actions
 const MapController: React.FC<{
   drawPath: boolean;
@@ -282,12 +360,32 @@ const MapController: React.FC<{
   destCoord: { lat: number; lng: number } | null;
   planMarkers: PlanMapMarker[];
   selectedStopId: number | null;
-}> = ({ drawPath, path, originCoord, destCoord, planMarkers, selectedStopId }) => {
+  // Day isolation (finalized map): App.tsx nulls originCoord/destCoord to
+  // hide the start/finish pins while a single day is isolated, which would
+  // otherwise change this effect's own dependencies and trigger an
+  // unwanted autofit — the user explicitly stayed where they were zoomed,
+  // isolating a day is a visibility filter, not a "recenter" action.
+  isolatedActive: boolean;
+}> = ({ drawPath, path, originCoord, destCoord, planMarkers, selectedStopId, isolatedActive }) => {
   const map = useMap();
+  // True for one extra effect run right after isolatedActive flips back to
+  // false — that's the render where origin/destCoord jump back to their
+  // real values (isolation just released them), which must NOT autofit
+  // either: the user is exiting isolation, not asking to recenter.
+  const wasIsolatedRef = useRef(false);
 
   // Fit/center priority: full route path > both endpoints > single endpoint > default view
   useEffect(() => {
     if (!map || !window.google) return;
+
+    if (isolatedActive) {
+      wasIsolatedRef.current = true;
+      return; // isolating a day is a visibility filter, never a camera move
+    }
+    if (wasIsolatedRef.current) {
+      wasIsolatedRef.current = false;
+      return; // just exited isolation -- origin/destCoord just got restored, don't refit on that either
+    }
 
     if (drawPath && path.length > 0) {
       const bounds = new window.google.maps.LatLngBounds();
@@ -313,7 +411,7 @@ const MapController: React.FC<{
     // Default initial view
     map.setCenter({ lat: 38.6, lng: -108.5 });
     map.setZoom(6);
-  }, [map, drawPath, path, originCoord, destCoord]);
+  }, [map, drawPath, path, originCoord, destCoord, isolatedActive]);
 
   // Center on selected real POI stop
   useEffect(() => {
@@ -346,9 +444,12 @@ export const TripMap: React.FC<TripMapProps> = ({
   highlightedDay,
   selectedStopId,
   onSelectStop,
+  selectedLodgingPlaceId,
+  onSelectLodging,
   onClosePopup,
   onToggleStop,
   readOnly = false,
+  isolatedActive = false,
 }) => {
   // Tracks the map's current zoom so stop-marker labels can be hidden below
   // STOP_LABEL_MIN_ZOOM (see comment above) — must be declared before the
@@ -464,6 +565,7 @@ export const TripMap: React.FC<TripMapProps> = ({
                 key={`plan-stop-${stop.id}`}
                 position={{ lat: stop.lat, lng: stop.lon }}
                 onClick={() => onSelectStop(stop.id)}
+                zIndex={included ? Z_STOP_SELECTED : Z_STOP_UNSELECTED}
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
                   <div
@@ -516,7 +618,7 @@ export const TripMap: React.FC<TripMapProps> = ({
             <AdvancedMarker
               key={`day-boundary-${idx}`}
               position={marker.position}
-              zIndex={5}
+              zIndex={Z_DAY_BADGE}
             >
               <div
                 style={{
@@ -541,27 +643,33 @@ export const TripMap: React.FC<TripMapProps> = ({
           ))}
 
           {/* Lodging markers (Фаза ночёвок): a distinct bed icon + color, never
-              confused with a yellow stop marker or a day-boundary badge. */}
+              confused with a yellow stop marker or a day-boundary badge.
+              Selected sits ABOVE unpicked candidates (higher zIndex) and
+              renders bright; unpicked candidates render muted — same
+              selected/excluded z-order convention as stop markers. */}
           {lodgingMarkers.map((marker, idx) => (
             <AdvancedMarker
               key={`lodging-${idx}`}
               position={marker.position}
               title={marker.name}
-              zIndex={6}
+              zIndex={marker.selected ? Z_LODGING_SELECTED : Z_LODGING_UNSELECTED}
+              onClick={() => onSelectLodging(marker.placeId)}
             >
               <div
                 style={{
                   width: '24px',
                   height: '24px',
                   borderRadius: '6px',
-                  backgroundColor: '#16a085',
+                  backgroundColor: marker.selected ? '#16a085' : '#5a5f66',
                   border: '2px solid #14171a',
                   display: 'flex',
                   alignItems: 'center',
                   justifyContent: 'center',
                   fontSize: '13px',
                   lineHeight: 1,
+                  opacity: marker.selected ? 1 : 0.55,
                   boxShadow: '0 1px 3px rgba(0,0,0,0.5)',
+                  cursor: 'pointer',
                 }}
               >
                 🛏
@@ -578,6 +686,17 @@ export const TripMap: React.FC<TripMapProps> = ({
             return <StopPopup marker={marker} onToggleStop={onToggleStop} onClose={onClosePopup} readOnly={readOnly} />;
           })()}
 
+          {/* Popup for the selected lodging marker — same "one open at a
+              time" mechanism as StopPopup, keyed off selectedLodgingPlaceId
+              instead. Selecting a stop or a lodging marker clears the other
+              (see App.tsx's handleSelectStop/handleSelectLodging), so the
+              two popups can never both be open. */}
+          {selectedLodgingPlaceId !== null && (() => {
+            const marker = lodgingMarkers.find(m => m.placeId === selectedLodgingPlaceId);
+            if (!marker) return null;
+            return <LodgingPopup marker={marker} onClose={onClosePopup} />;
+          })()}
+
           {/* FitBounds & selected-stop centering controller */}
           <MapController
             drawPath={drawPath}
@@ -586,6 +705,7 @@ export const TripMap: React.FC<TripMapProps> = ({
             destCoord={destCoord}
             planMarkers={planMarkers}
             selectedStopId={selectedStopId}
+            isolatedActive={isolatedActive}
           />
         </Map>
 
@@ -630,8 +750,11 @@ export const TripMap: React.FC<TripMapProps> = ({
             <div><i style={{ background: ROUTE_COLOR, opacity: 0.35 }}></i>другие варианты</div>
           )}
           <div><i style={{ background: '#e8b53f' }}></i>остановка</div>
-          {lodgingMarkers.length > 0 && (
-            <div><i style={{ background: '#16a085' }}></i>ночёвка</div>
+          {lodgingMarkers.some(m => m.selected) && (
+            <div><i style={{ background: '#16a085' }}></i>ночёвка (выбрана)</div>
+          )}
+          {lodgingMarkers.some(m => !m.selected) && (
+            <div><i style={{ background: '#5a5f66', opacity: 0.55 }}></i>вариант ночёвки</div>
           )}
         </div>
       </div>

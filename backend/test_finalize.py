@@ -10,6 +10,7 @@ import db
 import directions
 import enrichment
 import finalize
+import trips
 from db import get_pool
 
 pytestmark = pytest.mark.anyio
@@ -177,15 +178,26 @@ _FAKE_ENRICH_RESULT = {
 }
 
 
+async def _make_anonymous_session(conn) -> uuid.UUID:
+    """A real app.anonymous_sessions row — trip_projects.anonymous_session_id
+    is a foreign key, so ownership tests exercising save_draft/start_finalization's
+    session_id can't just pass an arbitrary uuid4() (see test_auth.py's own
+    identical helper for the same reason)."""
+    row = await conn.fetchrow("INSERT INTO app.anonymous_sessions DEFAULT VALUES RETURNING id")
+    return row["id"]
+
+
 @pytest.fixture
 async def cleanup():
     """Same event-loop-per-test pool reset as test_auth.py's fixture (see its
     docstring), plus FK-ordered teardown for finalization_jobs/trip_versions:
     trip_projects cascades finalization_jobs away, but trip_versions and
     trip_projects.finalized_version_id reference each other, so trip_projects
-    has to go first regardless."""
+    has to go first regardless. "sessions" mirrors test_auth.py's own cleanup
+    — only populated by the ownership tests that need a real anonymous_sessions
+    row (trip_projects.anonymous_session_id is a foreign key)."""
     db._pool = None
-    created = {"trip_projects": [], "users": []}
+    created = {"trip_projects": [], "users": [], "sessions": []}
     try:
         yield created
     finally:
@@ -198,6 +210,10 @@ async def cleanup():
                 await conn.execute(
                     "DELETE FROM app.trip_versions WHERE trip_project_id = ANY($1::uuid[])",
                     created["trip_projects"],
+                )
+            if created["sessions"]:
+                await conn.execute(
+                    "DELETE FROM app.anonymous_sessions WHERE id = ANY($1::uuid[])", created["sessions"]
                 )
             if created["users"]:
                 await conn.execute(
@@ -219,7 +235,7 @@ async def test_finalize_charges_balance_and_creates_pending_job(cleanup):
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
 
     assert job.is_new is True
     assert job.status == "pending"
@@ -252,7 +268,7 @@ async def test_finalize_with_zero_balance_charges_nothing(cleanup):
     cleanup["trip_projects"].append(trip_id)
 
     with pytest.raises(finalize.InsufficientCreditsError) as exc_info:
-        await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+        await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
     assert exc_info.value.balance == 0
 
     pool = await get_pool()
@@ -279,8 +295,8 @@ async def test_finalize_idempotent_replay_does_not_charge_twice(cleanup):
     cleanup["trip_projects"].append(trip_id)
 
     key = str(uuid.uuid4())
-    first = await finalize.start_finalization(user_id, trip_id, idempotency_key=key)
-    second = await finalize.start_finalization(user_id, trip_id, idempotency_key=key)
+    first = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=key)
+    second = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=key)
 
     assert first.is_new is True
     assert second.is_new is False
@@ -305,10 +321,10 @@ async def test_finalize_in_flight_different_key_reuses_existing_job(cleanup):
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    first = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    first = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
     # A DIFFERENT key — simulates a retry that didn't reuse the original one.
     # The first job is still 'pending' (nothing called process_finalization).
-    second = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    second = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
 
     assert second.is_new is False
     assert second.id == first.id
@@ -337,8 +353,8 @@ async def test_finalize_concurrent_calls_only_charge_once(cleanup):
     cleanup["trip_projects"].append(trip_id)
 
     results = await asyncio.gather(
-        finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4())),
-        finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4())),
+        finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4())),
+        finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4())),
         return_exceptions=True,
     )
 
@@ -359,6 +375,217 @@ async def test_finalize_concurrent_calls_only_charge_once(cleanup):
         assert job_count == 1
 
 
+# --- Ownership: save_draft assigns owner_user_id immediately for an
+# already-logged-in session, and start_finalization's backfill safety net
+# covers a project that somehow still ended up with owner_user_id NULL
+# (e.g. created before this fix, or any other edge case) — but only ever
+# when THIS request's own session proves it belongs to this user. See
+# trips.py::save_draft and finalize.py::start_finalization's own comments.
+
+async def test_save_draft_sets_owner_user_id_when_session_already_logged_in(cleanup):
+    """The actual root-cause fix: a session that's ALREADY logged in at
+    creation time must not rely on claim_session_for_google_user (which only
+    fires on the /auth/google login event, never again afterwards) — save_draft
+    itself must stamp owner_user_id right away."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        session_id = await _make_anonymous_session(conn)
+    cleanup["users"].append(user_id)
+    cleanup["sessions"].append(session_id)
+
+    result = await trips.save_draft(
+        session_id=session_id,
+        trip_project_id=None,
+        title="Logged-in-from-the-start trip",
+        origin_name="Denver",
+        destination_name="Durango",
+        origin=(39.7392, -104.9903),
+        destination=(37.2753, -107.8801),
+        quiz_answers=None,
+        draft_state=None,
+        owner_user_id=user_id,
+    )
+    cleanup["trip_projects"].append(result["id"])
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT owner_user_id FROM app.trip_projects WHERE id = $1", result["id"]
+        )
+    assert row["owner_user_id"] == user_id
+
+
+async def test_save_draft_leaves_owner_user_id_null_for_anonymous_session(cleanup):
+    """Regression guard for the anonymous path: omitting owner_user_id (the
+    default) must still behave exactly as before this fix — ownerless until
+    claim_session_for_google_user backfills it at login."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        session_id = await _make_anonymous_session(conn)
+    cleanup["sessions"].append(session_id)
+
+    result = await trips.save_draft(
+        session_id=session_id,
+        trip_project_id=None,
+        title="Anonymous trip",
+        origin_name=None,
+        destination_name=None,
+        origin=None,
+        destination=None,
+        quiz_answers=None,
+        draft_state=None,
+    )
+    cleanup["trip_projects"].append(result["id"])
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT owner_user_id FROM app.trip_projects WHERE id = $1", result["id"]
+        )
+    assert row["owner_user_id"] is None
+
+
+async def test_start_finalization_succeeds_for_project_owned_since_creation(cleanup):
+    """End-to-end regression test for the reported bug: a user logged in
+    BEFORE creating the trip (save_draft stamps owner_user_id immediately,
+    see above) must be able to finalize it — this used to 404 because
+    owner_user_id was always NULL and claim never ran for them."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        session_id = await _make_anonymous_session(conn)
+    cleanup["users"].append(user_id)
+    cleanup["sessions"].append(session_id)
+
+    result = await trips.save_draft(
+        session_id=session_id,
+        trip_project_id=None,
+        title="Logged-in-from-the-start trip",
+        origin_name="Denver",
+        destination_name="Durango",
+        origin=(39.7392, -104.9903),
+        destination=(37.2753, -107.8801),
+        quiz_answers=None,
+        draft_state=None,
+        owner_user_id=user_id,
+    )
+    trip_id = result["id"]
+    cleanup["trip_projects"].append(trip_id)
+
+    job = await finalize.start_finalization(user_id, session_id, trip_id, idempotency_key=str(uuid.uuid4()))
+
+    assert job.is_new is True
+    assert job.status == "pending"
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        balance = await conn.fetchval("SELECT balance FROM app.credit_accounts WHERE user_id = $1", user_id)
+        assert balance == 0
+
+
+async def test_start_finalization_backfills_ownership_when_session_matches(cleanup):
+    """Safety net: a project with owner_user_id IS NULL but whose
+    anonymous_session_id matches THIS request's own session (and the caller
+    is logged in) gets its ownership assigned right before the strict check
+    — which then finds it legitimately, not via a relaxed predicate."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        session_id = await _make_anonymous_session(conn)
+    cleanup["users"].append(user_id)
+    cleanup["sessions"].append(session_id)
+
+    # owner_user_id intentionally NOT passed -> stays NULL, simulating a
+    # project that was never claimed (e.g. predates this fix).
+    result = await trips.save_draft(
+        session_id=session_id,
+        trip_project_id=None,
+        title="Never-claimed trip",
+        origin_name=None,
+        destination_name=None,
+        origin=None,
+        destination=None,
+        quiz_answers=None,
+        draft_state=None,
+    )
+    trip_id = result["id"]
+    cleanup["trip_projects"].append(trip_id)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        before = await conn.fetchval("SELECT owner_user_id FROM app.trip_projects WHERE id = $1", trip_id)
+    assert before is None  # confirms the row really is in the buggy NULL state first
+
+    job = await finalize.start_finalization(user_id, session_id, trip_id, idempotency_key=str(uuid.uuid4()))
+
+    assert job.is_new is True
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        after = await conn.fetchval("SELECT owner_user_id FROM app.trip_projects WHERE id = $1", trip_id)
+        assert after == user_id  # backfilled
+
+        balance = await conn.fetchval("SELECT balance FROM app.credit_accounts WHERE user_id = $1", user_id)
+        assert balance == 0  # charged normally, same as any other successful finalize
+
+
+async def test_start_finalization_never_reassigns_a_project_owned_by_someone_else(cleanup):
+    """Negative/credit-protection case: even if the CURRENT caller's session
+    happens to match the project's anonymous_session_id (e.g. a shared
+    browser/session reused across accounts), the backfill must never touch a
+    row that already belongs to someone else — owner_user_id IS NULL is the
+    whole guard. The strict check then correctly 404s, and nothing is
+    charged to the wrong account."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        owner_id = await _make_user(conn, balance=1)
+        attacker_id = await _make_user(conn, balance=1)
+        shared_session_id = await _make_anonymous_session(conn)
+    cleanup["users"].append(owner_id)
+    cleanup["users"].append(attacker_id)
+    cleanup["sessions"].append(shared_session_id)
+
+    result = await trips.save_draft(
+        session_id=shared_session_id,
+        trip_project_id=None,
+        title="Owner's trip",
+        origin_name=None,
+        destination_name=None,
+        origin=None,
+        destination=None,
+        quiz_answers=None,
+        draft_state=None,
+        owner_user_id=owner_id,
+    )
+    trip_id = result["id"]
+    cleanup["trip_projects"].append(trip_id)
+
+    with pytest.raises(finalize.TripNotFoundError):
+        await finalize.start_finalization(
+            attacker_id, shared_session_id, trip_id, idempotency_key=str(uuid.uuid4())
+        )
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Ownership untouched -- the backfill never fired (owner_user_id was
+        # not NULL), so it's still the real owner's, not silently reassigned.
+        owner_after = await conn.fetchval("SELECT owner_user_id FROM app.trip_projects WHERE id = $1", trip_id)
+        assert owner_after == owner_id
+
+        # Neither account was charged.
+        owner_balance = await conn.fetchval("SELECT balance FROM app.credit_accounts WHERE user_id = $1", owner_id)
+        attacker_balance = await conn.fetchval(
+            "SELECT balance FROM app.credit_accounts WHERE user_id = $1", attacker_id
+        )
+        assert owner_balance == 1
+        assert attacker_balance == 1
+
+        job_count = await conn.fetchval(
+            "SELECT count(*) FROM app.finalization_jobs WHERE trip_project_id = $1", trip_id
+        )
+        assert job_count == 0
+
+
 async def test_process_finalization_completes_with_real_pipeline(cleanup):
     """Google/Gemini themselves are mocked (no network, no cost) — everything
     else (draft_state parsing, stop filtering/sorting, dto assembly, snapshot
@@ -370,7 +597,7 @@ async def test_process_finalization_completes_with_real_pipeline(cleanup):
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
 
     with patch("directions.get_route_detail", new=AsyncMock(return_value=_FAKE_ROUTE_DETAIL)), \
          patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
@@ -414,8 +641,10 @@ async def test_process_finalization_completes_with_real_pipeline(cleanup):
         }
         # No selected_lodging was passed to process_finalization -> every day
         # carries lodging=None, not just an absent key (uniform shape, see
-        # finalize.py's snapshot_days comment).
-        expected_days = [{**d, "lodging": None} for d in _FAKE_ROUTE_DETAIL["days"]]
+        # finalize.py's snapshot_days comment). No lodging_options_by_day
+        # either -> lodging_options is [] for every day (see
+        # _sanitize_lodging_options_by_day's default-empty behavior).
+        expected_days = [{**d, "lodging": None, "lodging_options": []} for d in _FAKE_ROUTE_DETAIL["days"]]
         assert snapshot["days"] == expected_days
         # quiz_answers here is days=3/flexible_days=True (see _make_trip_with_draft's
         # default), actual is 1 day (_FAKE_ROUTE_DETAIL) — under, not over, so
@@ -447,7 +676,7 @@ async def test_process_finalization_refunds_when_google_fails(cleanup):
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
 
     with patch(
         "directions.get_route_detail",
@@ -480,7 +709,7 @@ async def test_process_finalization_refunds_when_enrichment_fails(cleanup):
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
 
     with patch("directions.get_route_detail", new=AsyncMock(return_value=_FAKE_ROUTE_DETAIL)), \
          patch("enrichment.enrich_route", new=AsyncMock(side_effect=enrichment.EnrichmentError("Gemini timeout"))):
@@ -647,7 +876,7 @@ async def test_process_finalization_with_selected_lodging_inserts_waypoints(clea
         "rating": 4.6, "vicinity": "123 Alpine Way, Ouray",
     }]
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
 
     with patch("services.stops.build_route_through", new=AsyncMock(return_value=fake_through)), \
          patch("directions.get_directions", new=AsyncMock(side_effect=fake_get_directions)), \
@@ -698,6 +927,142 @@ async def test_process_finalization_with_selected_lodging_inserts_waypoints(clea
         assert project_status == "finalized"
 
 
+async def test_process_finalization_carries_full_lodging_options_into_snapshot(cleanup):
+    """lodging_options_by_day (forwarded by the frontend from its own
+    finalize-preview response, see main.py's FinalizeRequest) must land in
+    snapshot.days[].lodging_options with every candidate, `selected` computed
+    from selected_lodging (not trusted from the payload itself) — while the
+    existing single "lodging" field/waypoint behavior stays byte-identical."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        trip_id = await _make_trip_with_draft(conn, user_id)
+    cleanup["users"].append(user_id)
+    cleanup["trip_projects"].append(trip_id)
+
+    fake_through = {
+        "legs": [
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 5000, "distance_km": 20.0},
+        ],
+        "total_s": 25000, "distance_km": 120.0, "route_shape": "valhalla_shape",
+    }
+    fake_google_result = {
+        "duration_s": 14000, "distance_km": 100.0, "shape": "google_shape_with_lodging",
+        "legs": [
+            {"duration_s": 2000, "distance_km": 10.0},
+            {"duration_s": 3000, "distance_km": 15.0},
+            {"duration_s": 4000, "distance_km": 20.0},
+            {"duration_s": 5000, "distance_km": 25.0},
+        ],
+    }
+    fake_baseline = {"duration_s": 12000, "distance_km": 90.0, "shape": "baseline_shape", "legs": []}
+
+    async def fake_get_directions(origin, destination, waypoints=None):
+        return fake_google_result if waypoints else fake_baseline
+
+    selected_lodging = [{
+        "day": 1, "place_id": "lodge123", "lat": 39.15, "lon": -105.15, "name": "Mountain Inn",
+        "rating": 4.6, "vicinity": "123 Alpine Way, Ouray",
+    }]
+    lodging_options_by_day = [
+        {
+            "day": 1,
+            "options": [
+                {"place_id": "lodge123", "name": "Mountain Inn", "lat": 39.15, "lon": -105.15,
+                 "rating": 4.6, "user_ratings_total": 300, "price_level": 2,
+                 "vicinity": "123 Alpine Way, Ouray", "maps_url": "https://maps/lodge123"},
+                {"place_id": "lodge999", "name": "Roadside Motel", "lat": 39.2, "lon": -105.2,
+                 "rating": 3.1, "user_ratings_total": 12, "price_level": 1,
+                 "vicinity": "Highway 50", "maps_url": "https://maps/lodge999"},
+                # Malformed entry (missing place_id) -- must be dropped, not crash.
+                {"name": "No Id Inn", "lat": 39.3, "lon": -105.3},
+            ],
+        },
+        {"day": 2, "options": []},  # last day never gets a picker, but harmless if sent
+    ]
+
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
+
+    with patch("services.stops.build_route_through", new=AsyncMock(return_value=fake_through)), \
+         patch("directions.get_directions", new=AsyncMock(side_effect=fake_get_directions)), \
+         patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
+        await finalize.process_finalization(job.id, selected_lodging, lodging_options_by_day)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        job_row = await conn.fetchrow(
+            "SELECT trip_version_id FROM app.finalization_jobs WHERE id = $1", job.id
+        )
+        snapshot = json.loads(await conn.fetchval(
+            "SELECT snapshot FROM app.trip_versions WHERE id = $1", job_row["trip_version_id"]
+        ))
+
+    day1, day2 = snapshot["days"]
+
+    # Existing single-lodging field/behavior: untouched.
+    assert day1["lodging"]["place_id"] == "lodge123"
+
+    # New field: every candidate present, malformed one dropped, selected
+    # computed from selected_lodging (not from anything in the payload).
+    assert [o["place_id"] for o in day1["lodging_options"]] == ["lodge123", "lodge999"]
+    chosen = next(o for o in day1["lodging_options"] if o["place_id"] == "lodge123")
+    other = next(o for o in day1["lodging_options"] if o["place_id"] == "lodge999")
+    assert chosen["selected"] is True
+    assert other["selected"] is False
+    assert other["name"] == "Roadside Motel"
+    assert other["user_ratings_total"] == 12
+    assert other["price_level"] == 1
+    assert other["vicinity"] == "Highway 50"
+    assert other["maps_url"] == "https://maps/lodge999"
+
+    # Day 2 got an explicit empty options list -> stays empty, no crash.
+    assert day2["lodging_options"] == []
+
+
+def test_sanitize_lodging_options_by_day_drops_malformed_entries():
+    selected = {1: "good-id"}
+    raw = [
+        {"day": 1, "options": [
+            {"place_id": "good-id", "name": "Good Inn", "lat": 1.0, "lon": 2.0},
+            {"place_id": "bad-coords", "name": "Bad Inn", "lat": "not-a-number", "lon": 2.0},
+            {"name": "No place_id", "lat": 1.0, "lon": 2.0},
+            "not-a-dict",
+            None,
+        ]},
+        {"day": "not-an-int", "options": []},  # whole entry dropped
+        "not-a-dict-entry",
+    ]
+
+    result = finalize._sanitize_lodging_options_by_day(raw, selected)
+
+    assert list(result.keys()) == [1]
+    assert [o["place_id"] for o in result[1]] == ["good-id"]
+    assert result[1][0]["selected"] is True
+
+
+def test_sanitize_lodging_options_by_day_fills_missing_optional_fields():
+    result = finalize._sanitize_lodging_options_by_day(
+        [{"day": 3, "options": [{"place_id": "p1", "name": "Bare Inn", "lat": 1.0, "lon": 2.0}]}],
+        {},
+    )
+
+    opt = result[3][0]
+    assert opt["rating"] is None
+    assert opt["user_ratings_total"] is None
+    assert opt["price_level"] is None
+    assert opt["vicinity"] is None
+    assert opt["maps_url"] == "https://www.google.com/maps/place/?q=place_id:p1"
+    assert opt["selected"] is False
+
+
+def test_sanitize_lodging_options_by_day_none_or_wrong_type_returns_empty():
+    assert finalize._sanitize_lodging_options_by_day(None, {}) == {}
+    assert finalize._sanitize_lodging_options_by_day("not-a-list", {}) == {}
+    assert finalize._sanitize_lodging_options_by_day([], {}) == {}
+
+
 # --- day_plan: derived from finished snapshot.days, not get_route_detail ---
 # fits_plan (see finalize.py's docstring on why it's unused for this) is
 # never touched here — quiz_answers["days"]/["flexible_days"] vs
@@ -720,7 +1085,7 @@ async def test_day_plan_over_plan_when_actual_exceeds_requested_and_not_flexible
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
     with patch("directions.get_route_detail", new=AsyncMock(return_value=_TWO_DAY_ROUTE_DETAIL)), \
          patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
         await finalize.process_finalization(job.id)
@@ -745,7 +1110,7 @@ async def test_day_plan_flexible_suppresses_over_plan(cleanup):
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
     with patch("directions.get_route_detail", new=AsyncMock(return_value=_TWO_DAY_ROUTE_DETAIL)), \
          patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
         await finalize.process_finalization(job.id)
@@ -770,7 +1135,7 @@ async def test_day_plan_requested_null_when_days_not_answered(cleanup):
     cleanup["users"].append(user_id)
     cleanup["trip_projects"].append(trip_id)
 
-    job = await finalize.start_finalization(user_id, trip_id, idempotency_key=str(uuid.uuid4()))
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
     with patch("directions.get_route_detail", new=AsyncMock(return_value=_TWO_DAY_ROUTE_DETAIL)), \
          patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
         await finalize.process_finalization(job.id)

@@ -43,6 +43,7 @@ class FinalizationJob:
 
 async def start_finalization(
     user_id: uuid.UUID,
+    session_id: uuid.UUID,
     trip_project_id: uuid.UUID,
     idempotency_key: str,
 ) -> FinalizationJob:
@@ -60,10 +61,40 @@ async def start_finalization(
     - `credit_accounts ... FOR UPDATE` serializes concurrent attempts across
       ANY of this user's projects — what actually protects the balance from
       going negative under concurrent charges.
+
+    session_id is this REQUEST's own anonymous_session_id (session.id in
+    main.py, always present regardless of login state) — used ONLY for the
+    ownership backfill immediately below, never as a substitute for the
+    strict owner_user_id check that follows it.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
+            # Ownership backfill, NOT a relaxed ownership check: trips.py's
+            # save_draft now sets owner_user_id at creation time for a
+            # session that's already logged in, but a project created before
+            # this fix (or in some other edge case) can still have
+            # owner_user_id NULL with only anonymous_session_id set — the
+            # same situation claim_session_for_google_user (auth.py) fixes
+            # at login, except that event never fires again for someone
+            # already signed in. This assigns ownership ONLY when THIS
+            # request's own session proves the project is this user's:
+            # anonymous_session_id must match the CALLER's session_id, and
+            # the row must not already belong to anyone (owner_user_id IS
+            # NULL — never overwrites an existing owner, same invariant the
+            # login-time claim relies on). The strict SELECT ... FOR UPDATE
+            # right after this is completely unchanged and is still the
+            # actual gate — this step only makes sure a project that
+            # legitimately belongs to this session/user can be SEEN by it.
+            await conn.execute(
+                """
+                UPDATE app.trip_projects
+                SET owner_user_id = $1
+                WHERE id = $2 AND anonymous_session_id = $3 AND owner_user_id IS NULL
+                """,
+                user_id, trip_project_id, session_id,
+            )
+
             trip_row = await conn.fetchrow(
                 "SELECT id FROM app.trip_projects WHERE id = $1 AND owner_user_id = $2 FOR UPDATE",
                 trip_project_id, user_id,
@@ -616,8 +647,75 @@ async def _build_route_detail_with_lodging_round_trip(
     }
 
 
+def _sanitize_lodging_options_by_day(
+    raw: list[dict] | None, selected_place_id_by_day: dict[int, str]
+) -> dict[int, list[dict]]:
+    """Defensive parse of the frontend-forwarded lodging_options_by_day (see
+    FinalizeRequest, main.py) — optional, map-display-only data the frontend
+    already had in state from finalize-preview, carried through so the
+    finalized snapshot can show EVERY option on a night, not just the one
+    selected, without a second (billed) Places call. Never trusted blindly:
+    any entry missing the minimum shape (place_id/name/lat/lon, all the
+    right types) is dropped, and any unexpected exception here degrades to
+    {} — today's behavior, only the selected lodging shows — rather than
+    failing a PAID finalize over cosmetic map data.
+
+    `selected` is computed HERE, by matching (day, place_id) against
+    selected_lodging — never trusted from the frontend's own payload, since
+    selected_lodging (not this list) is the actual source of truth for what
+    the user picked.
+    """
+    result: dict[int, list[dict]] = {}
+    if not isinstance(raw, list):
+        return result
+    try:
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            day = entry.get("day")
+            options = entry.get("options")
+            if not isinstance(day, int) or isinstance(day, bool) or not isinstance(options, list):
+                continue
+
+            selected_place_id = selected_place_id_by_day.get(day)
+            clean_options = []
+            for opt in options:
+                if not isinstance(opt, dict):
+                    continue
+                place_id, name = opt.get("place_id"), opt.get("name")
+                lat, lon = opt.get("lat"), opt.get("lon")
+                if not isinstance(place_id, str) or not isinstance(name, str):
+                    continue
+                if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+                    continue
+
+                rating = opt.get("rating")
+                user_ratings_total = opt.get("user_ratings_total")
+                price_level = opt.get("price_level")
+                vicinity = opt.get("vicinity")
+                maps_url = opt.get("maps_url")
+                clean_options.append({
+                    "place_id": place_id,
+                    "name": name,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "rating": rating if isinstance(rating, (int, float)) and not isinstance(rating, bool) else None,
+                    "user_ratings_total": user_ratings_total if isinstance(user_ratings_total, int) and not isinstance(user_ratings_total, bool) else None,
+                    "price_level": price_level if isinstance(price_level, int) and not isinstance(price_level, bool) else None,
+                    "vicinity": vicinity if isinstance(vicinity, str) else None,
+                    "maps_url": maps_url if isinstance(maps_url, str) else f"https://www.google.com/maps/place/?q=place_id:{place_id}",
+                    "selected": place_id == selected_place_id,
+                })
+            result[day] = clean_options
+    except Exception:
+        return {}
+    return result
+
+
 async def _build_finalized_snapshot(
-    trip_project_id: uuid.UUID, selected_lodging: list[dict] | None = None
+    trip_project_id: uuid.UUID,
+    selected_lodging: list[dict] | None = None,
+    lodging_options_by_day: list[dict] | None = None,
 ) -> dict:
     """The real detailing pipeline (Фаза 3, подшаг 2; extended in Фаза
     ночёвок, подшаг 3, to route through selected lodging). Reads the trip's
@@ -751,6 +849,11 @@ async def _build_finalized_snapshot(
             "leg": s.get("leg"),
         })
 
+    selected_place_id_by_day = {
+        e["day"]: e["place_id"] for e in (selected_lodging or []) if isinstance(e.get("day"), int)
+    }
+    sanitized_lodging_by_day = _sanitize_lodging_options_by_day(lodging_options_by_day, selected_place_id_by_day)
+
     # Uniform day shape regardless of path taken above — "lodging" is always
     # present (dict or None), never a key that's just absent when nothing
     # was picked (no-lodging path's days, from directions.get_route_detail,
@@ -774,6 +877,13 @@ async def _build_finalized_snapshot(
                 "rating": lodging.get("rating"),
                 "vicinity": lodging.get("vicinity"),
             } if lodging else None,
+            # ALL candidates shown to the user in the free preview picker for
+            # this night, selected one included — [] when the frontend never
+            # sent lodging_options_by_day (older client) or nothing survived
+            # sanitization. Purely additive: the "lodging" field above is
+            # unchanged and still the single source for the existing
+            # "Ночёвка: ..." line/pin.
+            "lodging_options": sanitized_lodging_by_day.get(day["day"], []),
         })
 
     # How the day-split ACTUALLY came out vs what the quiz asked for —
@@ -818,7 +928,11 @@ async def _build_finalized_snapshot(
     }
 
 
-async def process_finalization(job_id: uuid.UUID, selected_lodging: list[dict] | None = None) -> None:
+async def process_finalization(
+    job_id: uuid.UUID,
+    selected_lodging: list[dict] | None = None,
+    lodging_options_by_day: list[dict] | None = None,
+) -> None:
     """Background task (FastAPI BackgroundTasks) — runs after the charging
     transaction in start_finalization has already committed and the HTTP
     response has been sent. Three short transactions, not one long one
@@ -826,13 +940,14 @@ async def process_finalization(job_id: uuid.UUID, selected_lodging: list[dict] |
     calls (Google/Gemini, подшаг 2), which have no business holding a DB
     transaction open.
 
-    selected_lodging comes straight from the /trips/{id}/finalize request
-    body (main.py) that scheduled this task — not persisted anywhere, purely
-    passed through BackgroundTasks' own arguments. An idempotency replay or
-    in-flight-job return never re-schedules this task (see FinalizationJob.
-    is_new's docstring), so a request's selected_lodging only ever matters
-    for the ONE call that actually created the job; the same is already true
-    of idempotency_key today, this just extends it.
+    selected_lodging/lodging_options_by_day come straight from the
+    /trips/{id}/finalize request body (main.py) that scheduled this task —
+    not persisted anywhere, purely passed through BackgroundTasks' own
+    arguments. An idempotency replay or in-flight-job return never
+    re-schedules this task (see FinalizationJob.is_new's docstring), so a
+    request's selected_lodging/lodging_options_by_day only ever matter for
+    the ONE call that actually created the job; the same is already true of
+    idempotency_key today, this just extends it.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -851,7 +966,7 @@ async def process_finalization(job_id: uuid.UUID, selected_lodging: list[dict] |
         )
 
     try:
-        snapshot = await _build_finalized_snapshot(trip_project_id, selected_lodging)
+        snapshot = await _build_finalized_snapshot(trip_project_id, selected_lodging, lodging_options_by_day)
 
         pool = await get_pool()
         async with pool.acquire() as conn:

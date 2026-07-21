@@ -1,5 +1,5 @@
 import React from 'react';
-import { TripMap, PlanMapMarker } from './TripMap';
+import { TripMap, PlanMapMarker, LodgingMapMarker } from './TripMap';
 
 interface MapComponentProps {
   // 'finalizing' renders exactly like 'plan' (see App.tsx's call site, which
@@ -22,8 +22,9 @@ interface MapComponentProps {
   activeDaySegments: Array<{ points: Array<{ lat: number; lng: number }>; color: string; dayNumber: number }>;
   dayBoundaryMarkers: Array<{ position: { lat: number; lng: number }; color: string; label: string }>;
   // Фаза ночёвок: only ever populated in phase 'finalized' (a snapshot's
-  // chosen lodging) — App.tsx passes [] for every other phase.
-  lodgingMarkers: Array<{ position: { lat: number; lng: number }; name: string }>;
+  // lodging data, selected + candidate options) — App.tsx passes [] for
+  // every other phase.
+  lodgingMarkers: LodgingMapMarker[];
   // Сворачиваемые дни (Фаза 3, показ): clicking a day's route segment on the
   // map expands/scrolls to it in FinalizedView. Only meaningful in phase
   // 'finalized' — passed through unconditionally, harmless elsewhere since
@@ -32,8 +33,15 @@ interface MapComponentProps {
   highlightedDay?: number | null;
   selectedStopId: number | null;
   onSelectStop: (id: number) => void;
+  selectedLodgingPlaceId: string | null;
+  onSelectLodging: (placeId: string) => void;
   onClosePopup: () => void;
   onToggleStop: (id: number) => void;
+  // Day isolation (finalized map only): true while a single day is
+  // isolated — suppresses TripMap's autofit so hiding/restoring the
+  // start/finish pins around isolation never moves the camera. Optional,
+  // defaults false, so every non-finalized caller is unaffected.
+  isolatedActive?: boolean;
 }
 
 export const MapComponent: React.FC<MapComponentProps> = ({
@@ -55,8 +63,11 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   highlightedDay,
   selectedStopId,
   onSelectStop,
+  selectedLodgingPlaceId,
+  onSelectLodging,
   onClosePopup,
-  onToggleStop
+  onToggleStop,
+  isolatedActive = false,
 }) => {
   // 'generating' shows a live single-line preview while the plan overlay isn't
   // ready yet; 'plan'/'finalizing' (same overlay, see prop comment above) and
@@ -84,9 +95,12 @@ export const MapComponent: React.FC<MapComponentProps> = ({
         highlightedDay={highlightedDay}
         selectedStopId={selectedStopId}
         onSelectStop={onSelectStop}
+        selectedLodgingPlaceId={selectedLodgingPlaceId}
+        onSelectLodging={onSelectLodging}
         onClosePopup={onClosePopup}
         onToggleStop={onToggleStop}
         readOnly={phase === 'finalized' || phase === 'finalizing'}
+        isolatedActive={isolatedActive}
       />
     </div>
   );

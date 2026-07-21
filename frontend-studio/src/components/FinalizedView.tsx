@@ -1,5 +1,5 @@
 import React, { forwardRef, useImperativeHandle, useRef, useState } from 'react';
-import { AlertTriangle, ChevronDown, ChevronRight, Info, Calendar, CheckCircle2, BedDouble, ExternalLink, Navigation } from 'lucide-react';
+import { AlertTriangle, ChevronDown, ChevronRight, Info, Calendar, CheckCircle2, BedDouble, ExternalLink, Navigation, Focus } from 'lucide-react';
 import { DayPlan, FinalizedLodging, FinalizedStop, FinalizedTripResult } from '../api';
 import { formatDuration, formatDaysRu } from '../format';
 import { dayColor } from '../dayColors';
@@ -12,6 +12,12 @@ export interface FinalizedViewProps {
   onEditDraft: () => void;
   // Reverse highlight (map segment hover -> panel), optional per spec.
   onDayHover?: (day: number | null) => void;
+  // Day isolation (map-only filter, see the isolatedDay state below): fires
+  // with the newly isolated day number, or null when isolation is cleared.
+  // App.tsx mirrors this into its own state since that's where the actual
+  // map data (planMarkersForMap etc.) gets built — FinalizedView itself
+  // only owns which icon looks active.
+  onIsolateDayChange?: (day: number | null) => void;
 }
 
 // Imperative, not a prop, on purpose: expandedDays/activeDay are FinalizedView's
@@ -139,7 +145,7 @@ const formatFinalizedAt = (iso: string): string => {
 // snapshot exactly as it was locked in, no checkboxes, no option tabs (a
 // finalized trip has exactly one route, not several alternatives to compare).
 export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>(({
-  trip, selectedStopId, onSelectStop, onEditDraft, onDayHover,
+  trip, selectedStopId, onSelectStop, onEditDraft, onDayHover, onIsolateDayChange,
 }, ref) => {
   const orderById = new Map(trip.stops.map((s, i) => [s.id, i + 1]));
 
@@ -151,6 +157,14 @@ export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>
   // "Last day clicked on the map" — an accent, not a second expand/collapse
   // flag (see FinalizedViewHandle's own comment on why this is imperative).
   const [activeDay, setActiveDay] = useState<number | null>(null);
+  // Map-only "show just this day" toggle — independent of the accordion
+  // above (expanding/collapsing a day's card never affects isolation, and
+  // vice versa). null = whole trip on the map (current behavior); a number
+  // = only that day's segments/stops/bounding lodging. Not persisted
+  // anywhere (not snapshot, not draft_state) — purely a view state, same
+  // category as expandedDays/activeDay, mutually exclusive with itself by
+  // construction (at most one day number at a time).
+  const [isolatedDay, setIsolatedDay] = useState<number | null>(null);
   const dayHeaderRefs = useRef<Map<number, HTMLDivElement>>(new Map());
 
   const toggleDay = (dayNumber: number) => {
@@ -158,6 +172,19 @@ export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>
       const next = new Set(prev);
       if (next.has(dayNumber)) next.delete(dayNumber);
       else next.add(dayNumber);
+      return next;
+    });
+  };
+
+  // Separate trigger from the accordion chevron — stopPropagation so a
+  // click here can never also toggle expand/collapse (they're sibling
+  // buttons, not nested, so this is mostly defensive, but matches the
+  // "isolate is independent of the accordion" requirement explicitly).
+  const toggleIsolateDay = (dayNumber: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setIsolatedDay((prev) => {
+      const next = prev === dayNumber ? null : dayNumber;
+      onIsolateDayChange?.(next);
       return next;
     });
   };
@@ -216,6 +243,7 @@ export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>
           );
           const isExpanded = expandedDays.has(day.day);
           const isActive = activeDay === day.day;
+          const isIsolated = isolatedDay === day.day;
 
           return (
             <div
@@ -224,40 +252,57 @@ export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>
               onMouseEnter={() => onDayHover?.(day.day)}
               onMouseLeave={() => onDayHover?.(null)}
             >
-              <button
-                type="button"
-                ref={(el) => {
-                  if (el) dayHeaderRefs.current.set(day.day, el);
-                  else dayHeaderRefs.current.delete(day.day);
-                }}
-                onClick={() => toggleDay(day.day)}
-                className="w-full flex items-center justify-between gap-2 px-0.5 pt-1 pb-1.5 text-left cursor-pointer"
-                aria-expanded={isExpanded}
-              >
-                <div className="flex items-baseline gap-1.5 min-w-0">
-                  {isExpanded ? (
-                    <ChevronDown size={13} className="text-[#8b9199] flex-shrink-0" />
-                  ) : (
-                    <ChevronRight size={13} className="text-[#8b9199] flex-shrink-0" />
-                  )}
-                  <span
-                    className="w-2.5 h-2.5 rounded-full flex-shrink-0"
-                    style={{ backgroundColor: dayColor(day.day - 1) }}
-                  />
-                  <span className="text-[11px] font-bold uppercase tracking-wide text-[#f2ede3] font-mono flex-shrink-0">
-                    День {day.day}
-                  </span>
-                  <span className="text-[11px] font-mono text-[#8b9199] flex-shrink-0">
-                    · ~{formatDuration(day.total_s)}
-                  </span>
-                  <span className="text-[10px] text-[#5a5f66] flex-shrink-0">
-                    · {dayStops.length} {dayStops.length === 1 ? 'остановка' : dayStops.length < 5 ? 'остановки' : 'остановок'}
-                  </span>
-                  {day.lodging && (
-                    <span className="text-[10px] text-[#16a085] truncate">· 🛏 {day.lodging.name}</span>
-                  )}
-                </div>
-              </button>
+              <div className="w-full flex items-center gap-0.5">
+                <button
+                  type="button"
+                  ref={(el) => {
+                    if (el) dayHeaderRefs.current.set(day.day, el);
+                    else dayHeaderRefs.current.delete(day.day);
+                  }}
+                  onClick={() => toggleDay(day.day)}
+                  className="flex-1 min-w-0 flex items-center justify-between gap-2 px-0.5 pt-1 pb-1.5 text-left cursor-pointer"
+                  aria-expanded={isExpanded}
+                >
+                  <div className="flex items-baseline gap-1.5 min-w-0">
+                    {isExpanded ? (
+                      <ChevronDown size={13} className="text-[#8b9199] flex-shrink-0" />
+                    ) : (
+                      <ChevronRight size={13} className="text-[#8b9199] flex-shrink-0" />
+                    )}
+                    <span
+                      className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                      style={{ backgroundColor: dayColor(day.day - 1) }}
+                    />
+                    <span className="text-[11px] font-bold uppercase tracking-wide text-[#f2ede3] font-mono flex-shrink-0">
+                      День {day.day}
+                    </span>
+                    <span className="text-[11px] font-mono text-[#8b9199] flex-shrink-0">
+                      · ~{formatDuration(day.total_s)}
+                    </span>
+                    <span className="text-[10px] text-[#5a5f66] flex-shrink-0">
+                      · {dayStops.length} {dayStops.length === 1 ? 'остановка' : dayStops.length < 5 ? 'остановки' : 'остановок'}
+                    </span>
+                    {day.lodging && (
+                      <span className="text-[10px] text-[#16a085] truncate">· 🛏 {day.lodging.name}</span>
+                    )}
+                  </div>
+                </button>
+                {/* Isolate-on-map toggle — independent of the accordion
+                    button above (sibling, not nested): clicking it never
+                    expands/collapses this day's card, and expanding/
+                    collapsing never affects isolation. */}
+                <button
+                  type="button"
+                  onClick={(e) => toggleIsolateDay(day.day, e)}
+                  className={`flex-shrink-0 p-1 mr-0.5 rounded cursor-pointer transition-colors ${
+                    isIsolated ? 'text-[#e8b53f] bg-[#e8b53f]/10' : 'text-[#5a5f66] hover:text-[#8b9199]'
+                  }`}
+                  title={isIsolated ? 'Показать всю поездку на карте' : 'Показать только этот день на карте'}
+                  aria-pressed={isIsolated}
+                >
+                  <Focus size={13} />
+                </button>
+              </div>
 
               {isExpanded && (
                 <div className="pb-1.5">

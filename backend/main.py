@@ -212,6 +212,7 @@ async def save_trip(req: SaveTripRequest, session: sessions.Session = Depends(se
             destination=(req.destination.lat, req.destination.lon) if req.destination else None,
             quiz_answers=req.quiz_answers,
             draft_state=req.draft_state,
+            owner_user_id=session.user_id,
         )
     except trips.TripAccessError:
         raise HTTPException(status_code=403, detail="Этот черновик принадлежит другой сессии.")
@@ -355,6 +356,18 @@ class FinalizeRequest(BaseModel):
     # an empty list) means no lodging at all: the route stays origin ->
     # stops -> destination exactly as before Фаза ночёвок existed.
     selected_lodging: list[SelectedLodgingIn] | None = None
+    # Full lodging candidate list per night, straight from finalize-preview's
+    # own response (the frontend already has it in state) — carried through
+    # so the finalized snapshot can show ALL options on the map, not just the
+    # selected one. Raw (list[dict]), not a typed model, on purpose: this is
+    # optional, display-only data — a malformed or missing entry must never
+    # fail a PAID finalize request over a Pydantic validation error.
+    # finalize.py sanitizes it defensively instead (see
+    # _sanitize_lodging_options_by_day) rather than rejecting the whole
+    # request. Expected shape per entry: {"day": int, "options": [{place_id,
+    # name, lat, lon, rating, user_ratings_total, price_level, vicinity,
+    # maps_url}, ...]} — same shape as FinalizePreviewResponse.days[].lodging_options.
+    lodging_options_by_day: list[dict] | None = None
 
 
 class FinalizeResponse(BaseModel):
@@ -388,6 +401,7 @@ async def finalize_trip(
     try:
         job = await finalize.start_finalization(
             user_id=session.user_id,
+            session_id=session.id,
             trip_project_id=trip_id,
             idempotency_key=idempotency_key,
         )
@@ -407,7 +421,9 @@ async def finalize_trip(
     # own docstring).
     if job.is_new:
         selected_lodging = [s.model_dump() for s in req.selected_lodging] if req.selected_lodging else None
-        background_tasks.add_task(finalize.process_finalization, job.id, selected_lodging)
+        background_tasks.add_task(
+            finalize.process_finalization, job.id, selected_lodging, req.lodging_options_by_day
+        )
 
     return FinalizeResponse(job_id=job.id, status=job.status, trip_version_id=job.trip_version_id, error=job.error)
 
@@ -770,6 +786,24 @@ class FinalizedLodgingOut(BaseModel):
     vicinity: str | None
 
 
+# Same fields as LodgingOptionOut (finalize-preview's own candidate shape)
+# plus `selected` — every candidate shown for this night, selected one
+# included, so the finalized map can render all of them. See finalize.py's
+# _sanitize_lodging_options_by_day for how untrusted frontend-forwarded data
+# ends up in this shape.
+class FinalizedLodgingOptionOut(BaseModel):
+    place_id: str
+    name: str
+    lat: float
+    lon: float
+    rating: float | None
+    user_ratings_total: int | None
+    price_level: int | None
+    vicinity: str | None
+    maps_url: str
+    selected: bool
+
+
 # Own shape rather than reusing DayOut (which /detail-route's free, lodging-
 # unaware response also uses) — every finalized day always carries a
 # lodging field (dict or None), a concept that response never needs.
@@ -781,6 +815,10 @@ class FinalizedDayOut(BaseModel):
     total_s: int
     over_limit: bool
     lodging: FinalizedLodgingOut | None
+    # [] by default so a trip_versions.snapshot finalized before this field
+    # existed (or one where the frontend never sent lodging_options_by_day)
+    # still parses — the map just falls back to showing only `lodging` above.
+    lodging_options: list[FinalizedLodgingOptionOut] = []
 
 
 class DayPlanOut(BaseModel):

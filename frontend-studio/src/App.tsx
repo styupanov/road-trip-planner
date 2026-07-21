@@ -16,7 +16,7 @@ import {
 } from './api';
 import { mapDetourToMaxDetourS, mapDriveToDailyLimitS, mapInterestsToCategories, mapPaceToApiPace } from './quizMapping';
 import { dayColor } from './dayColors';
-import { splitPathIntoLegs } from './routeSegments';
+import { splitPathIntoLegs, pivotDayIndex } from './routeSegments';
 import { PlanPanel, RouteThroughSummary } from './components/PlanPanel';
 import { DateModal } from './components/DateModal';
 import { FinalizeGateModal } from './components/FinalizeGateModal';
@@ -124,6 +124,11 @@ export default function App() {
   const [enrichLoadingOptionIndex, setEnrichLoadingOptionIndex] = useState<number | null>(null);
   const [showDateModal, setShowDateModal] = useState<boolean>(false);
   const [selectedStopId, setSelectedStopId] = useState<number | null>(null);
+  // Фаза ночёвок (finalized map): which lodging marker's popup is open, if
+  // any — mirrors selectedStopId's "one popup at a time" pattern, kept as a
+  // separate id space (place_id, not a stop's numeric id) since a lodging
+  // marker and a stop marker are never the same entity.
+  const [selectedLodgingPlaceId, setSelectedLodgingPlaceId] = useState<string | null>(null);
   // Origin/destination actually used to build the current itinerary — snapshotted at
   // generation time, independent of the draggable A/B markers' live originCoord/destCoord
   const [routeOrigin, setRouteOrigin] = useState<{ lat: number; lng: number } | null>(null);
@@ -208,6 +213,12 @@ export default function App() {
   // (not in FinalizedView) because the map's rendering data is already
   // computed in this component, not in FinalizedView.
   const [hoveredMapDay, setHoveredMapDay] = useState<number | null>(null);
+  // Day isolation (finalized map only): mirrors FinalizedView's OWN
+  // isolatedDay state (source of truth for its icon's active look) —
+  // same split as hoveredMapDay above, since the actual map-data filtering
+  // has to happen here where planMarkersForMap/activeDaySegments/etc. are
+  // already being built, not inside FinalizedView.
+  const [isolatedDay, setIsolatedDay] = useState<number | null>(null);
 
   // Auth state (Фаза 2) — who the CURRENT session is linked to, if anyone.
   // Fetched once on mount via getMe(); updated in place by
@@ -373,7 +384,6 @@ export default function App() {
   };
 
   const isCurrentStepValid = () => {
-    if (currentQuestion.k === 'avoid') return true; // optional
     const val = answers[currentQuestion.k];
     if (currentQuestion.type === 'text') {
       return typeof val === 'string' && val.trim() !== '';
@@ -635,7 +645,7 @@ export default function App() {
     setDetourSummary((currentAnswers.detour as string) || 'до 30 мин');
 
     const interestsStr = (currentAnswers.interests as string[] || ['каньоны']).join(', ');
-    const userPromptText = `Я хочу спланировать поездку из ${currentAnswers.origin} в ${currentAnswers.dest} на ${currentAnswers.days} дней. Люблю ${interestsStr}. Не хочу ехать больше ${((currentAnswers.drive as string) || 'до 4 ч').replace('до ', '')} в день, готов на крюк ${currentAnswers.detour || 'до 30 мин'}. Темп ${currentAnswers.pace || 'спокойный'}.${currentAnswers.avoid ? ' Исключить: ' + currentAnswers.avoid + '.' : ''}`;
+    const userPromptText = `Я хочу спланировать поездку из ${currentAnswers.origin} в ${currentAnswers.dest} на ${currentAnswers.days} дней. Люблю ${interestsStr}. Не хочу ехать больше ${((currentAnswers.drive as string) || 'до 4 ч').replace('до ', '')} в день, готов на крюк ${currentAnswers.detour || 'до 30 мин'}. Темп ${currentAnswers.pace || 'спокойный'}.`;
 
     const botWelcomeText = 'Так я понял вашу поездку. Можно уточнить в чате — например, добавить обязательное место или поменять лимиты. Когда готовы, нажмите «Построить маршрут».';
 
@@ -834,11 +844,20 @@ export default function App() {
       autosaveTimerRef.current = null;
     }
 
+    // Same data the free preview picker showed — forwarded so the finalized
+    // snapshot can carry every option, not just the one selected (see
+    // finalize.py's _sanitize_lodging_options_by_day). null when the
+    // preview was never fetched (shouldn't happen by this point, but stays
+    // consistent with selectedLodging's own null-safe handling).
+    const lodgingOptionsByDay = finalizePreview
+      ? finalizePreview.days.map(d => ({ day: d.day, options: d.lodging_options }))
+      : null;
+
     saveDraftNow()
       // saveDraftNow never rejects (see its own comment) — even a failed save
       // still leaves the last successfully-saved draft_state for Finalize to
       // read, so proceeding here regardless is intentional, not a swallowed bug.
-      .then(() => postFinalizeTrip(tripId, idKey, selectedLodging))
+      .then(() => postFinalizeTrip(tripId, idKey, selectedLodging, lodgingOptionsByDay))
       .then(result => {
         setFinalizeSubmitting(false);
         setFinalizeGateStage(null);
@@ -1130,8 +1149,17 @@ export default function App() {
   };
 
   // Selects a stop marker/row — just pans the map, doesn't change checkbox state.
+  // Clears any open lodging popup so the two marker types never both show one.
   const handleSelectStop = (id: number) => {
     setSelectedStopId(id);
+    setSelectedLodgingPlaceId(null);
+  };
+
+  // Selects a lodging marker (finalized map) — opens its popup, closes any
+  // open stop popup (same mutual-exclusivity as handleSelectStop above).
+  const handleSelectLodging = (placeId: string) => {
+    setSelectedLodgingPlaceId(placeId);
+    setSelectedStopId(null);
   };
 
   // Recomputes the through-route for the given option's included stops. `optionIndex`
@@ -1360,10 +1388,26 @@ export default function App() {
   let planRouteLinesForMap: Array<{ points: { lat: number; lng: number }[]; isActive: boolean }>;
   let planMarkersForMap: Array<{ stop: ApiStop; included: boolean; order: number | null }>;
   let activeDaySegments: Array<{ points: { lat: number; lng: number }[]; color: string; dayNumber: number }> = [];
+  // Overridden below ONLY when isolating a middle day of a finalized trip
+  // (start/finish pins hidden unless they're the isolated day's own
+  // boundary) — every other phase/case passes these straight through
+  // unchanged, same as before day isolation existed.
+  let originCoordForMap = originCoord;
+  let destCoordForMap = destCoord;
   let dayBoundaryMarkersForMap: Array<{ position: { lat: number; lng: number }; color: string; label: string }> = [];
   // Фаза ночёвок: only ever populated for 'finalized' — nothing is chosen
   // yet during the free draft.
-  let lodgingMarkersForMap: Array<{ position: { lat: number; lng: number }; name: string }> = [];
+  let lodgingMarkersForMap: Array<{
+    position: { lat: number; lng: number };
+    name: string;
+    placeId: string;
+    rating: number | null;
+    userRatingsTotal: number | null;
+    priceLevel: number | null;
+    vicinity: string | null;
+    mapsUrl: string;
+    selected: boolean;
+  }> = [];
 
   if (phase === 'finalized' && finalizedTrip) {
     const finOrigin = { lat: finalizedTrip.origin.lat, lng: finalizedTrip.origin.lon };
@@ -1387,55 +1431,85 @@ export default function App() {
       order: orderByIdFinal.get(s.id) ?? null,
     }));
 
-    // Round-trip: `finDest` is the loop's pivot X (see FinalizedTripResult's
-    // own docstring), not where the trip physically ends — the loop always
-    // closes back at `finOrigin`. X is never itself a stop (see backend's
-    // _parse_active_selection), so it has to be inserted explicitly at the
-    // leg1/leg2 boundary, and the waypoint list has to END at `finOrigin`
-    // again — otherwise splitPathIntoLegs' last segment gets matched against
-    // X's position (roughly mid-path, where the pivot crossing happens)
-    // instead of the path's actual end, truncating the final segment before
-    // it ever reaches back to A.
-    const leg1Stops = finalizedTrip.round_trip ? finalizedTrip.stops.filter(s => s.leg !== 1) : finalizedTrip.stops;
-    const leg2Stops = finalizedTrip.round_trip ? finalizedTrip.stops.filter(s => s.leg === 1) : [];
-    const l1 = leg1Stops.length;
+    // Waypoint list used only to slice `path` into per-day colored segments
+    // (splitPathIntoLegs matches each of these against the nearest point on
+    // the real polyline) — day_split/Directions/the snapshot itself are
+    // untouched, this is purely a rendering concern. Two kinds of point
+    // never correspond to a real stop and need their day attributed
+    // explicitly, built in lockstep as each is pushed rather than
+    // recovered afterwards by index-shift arithmetic:
+    // - the round-trip pivot X (`finDest` — see FinalizedTripResult's own
+    //   docstring, it's never itself a stop, see backend's
+    //   _parse_active_selection). The waypoint list has to END at
+    //   `finOrigin` again for round-trip — otherwise splitPathIntoLegs'
+    //   last segment matches X's position (mid-path) instead of the path's
+    //   real end, truncating the final segment before it reaches back to A.
+    // - a night's chosen lodging (`day.lodging`): Google is actually routed
+    //   through it (finalize.py's _build_route_detail_with_lodging inserts
+    //   it into Directions' own waypoints the exact same way — see
+    //   finalize.py:460-474), so the real polyline bends through the hotel;
+    //   the day-color boundary has to land there too, not on the day's
+    //   last attraction, which is all splitPathIntoLegs' waypoints used to
+    //   contain.
+    // waypointDays[k] is the day (index into finalizedTrip.days) that owns
+    // the hop INTO waypoints[k+1] — i.e. legSegments[k]. Building it
+    // alongside waypoints turns dayIdxForSegment into a plain array lookup
+    // below, never index-shift math.
+    const l1 = finalizedTrip.round_trip
+      ? finalizedTrip.stops.filter(s => s.leg !== 1).length
+      : finalizedTrip.stops.length;
+    const lastDayIdx = Math.max(finalizedTrip.days.length - 1, 0);
 
-    const waypoints = finalizedTrip.round_trip
-      ? [
-          finOrigin,
-          ...leg1Stops.map(s => ({ lat: s.lat, lng: s.lon })),
-          finDest,
-          ...leg2Stops.map(s => ({ lat: s.lat, lng: s.lon })),
-          finOrigin,
-        ]
-      : [finOrigin, ...finalizedTrip.stops.map(s => ({ lat: s.lat, lng: s.lon })), finDest];
+    const waypoints: { lat: number; lng: number }[] = [finOrigin];
+    const waypointDays: number[] = [];
+    let pivotInserted = !finalizedTrip.round_trip;
+
+    finalizedTrip.days.forEach((day, dayIdx) => {
+      // Whether THIS day has pushed one of its own stops yet in this same
+      // walk — see routeSegments.ts::pivotDayIndex: it decides whether the
+      // pivot hop belongs to this day (mid-day crossing) or the PREVIOUS
+      // one (crossing landed exactly on a day boundary, this day
+      // contributed nothing before it).
+      let dayHasOwnStop = false;
+      for (const si of day.stop_indices) {
+        if (!pivotInserted && si >= l1) {
+          waypoints.push(finDest);
+          waypointDays.push(pivotDayIndex(dayIdx, dayHasOwnStop));
+          pivotInserted = true;
+        }
+        const stop = finalizedTrip.stops[si];
+        if (!stop) continue;
+        waypoints.push({ lat: stop.lat, lng: stop.lon });
+        waypointDays.push(dayIdx);
+        dayHasOwnStop = true;
+      }
+      if (day.lodging) {
+        // Always at the END of this day's own sequence (after a mid-day
+        // pivot crossing too, if there was one) — mirrors finalize.py's own
+        // waypoint order for Directions exactly.
+        waypoints.push({ lat: day.lodging.lat, lng: day.lodging.lon });
+        waypointDays.push(dayIdx);
+      }
+    });
+    // leg2 has zero stops (l1 === total stop count) never trips the
+    // per-stop check above — the crossing happens right at the very end,
+    // before the final return leg. Same "closes wherever it lands"
+    // attribution used everywhere else in this app.
+    if (!pivotInserted) {
+      waypoints.push(finDest);
+      waypointDays.push(lastDayIdx);
+    }
+    waypoints.push(finalizedTrip.round_trip ? finOrigin : finDest);
+    waypointDays.push(lastDayIdx);
+
     const legSegments = splitPathIntoLegs(path, waypoints);
     const stopIndexToDay = new Map<number, number>();
     finalizedTrip.days.forEach((day, dayIdx) => {
       day.stop_indices.forEach(si => stopIndexToDay.set(si, dayIdx));
     });
-    const lastDayIdx = finalizedTrip.days.length - 1;
-
-    // legIdx maps 1:1 onto global stop_indices for one-way (waypoints =
-    // [origin, ...stops, destination]). Round-trip inserts ONE extra
-    // waypoint (X) right after leg1's stops, so every segment from there on
-    // is shifted by 1 — and the hop INTO X itself (legIdx === l1) has no
-    // stop of its own to look up, so it's attributed to whichever day the
-    // pivot crossing falls in (the day containing the last leg1 stop, or
-    // day 1 when leg1 has no stops) — same convention
-    // day_split.split_into_days uses for the merged pivot hop's drive time.
-    const dayIdxForSegment = (legIdx: number): number => {
-      if (!finalizedTrip.round_trip) {
-        return legIdx < finalizedTrip.stops.length ? stopIndexToDay.get(legIdx) ?? lastDayIdx : lastDayIdx;
-      }
-      if (legIdx < l1) return stopIndexToDay.get(legIdx) ?? lastDayIdx;
-      if (legIdx === l1) return stopIndexToDay.get(Math.max(l1 - 1, 0)) ?? lastDayIdx;
-      if (legIdx <= l1 + leg2Stops.length) return stopIndexToDay.get(legIdx - 1) ?? lastDayIdx;
-      return lastDayIdx;
-    };
 
     activeDaySegments = legSegments.map((points, legIdx) => {
-      const dayIdx = dayIdxForSegment(legIdx);
+      const dayIdx = waypointDays[legIdx] ?? lastDayIdx;
       // Сворачиваемые дни: dayNumber is the actual day.day (1-based), not the
       // array index — TripMap reports THIS back on segment click, and it has
       // to match what FinalizedView keys its accordion/refs by.
@@ -1450,12 +1524,73 @@ export default function App() {
         : null;
     }).filter((m): m is { position: { lat: number; lng: number }; color: string; label: string } => m != null);
 
-    lodgingMarkersForMap = finalizedTrip.days
-      .filter(day => day.lodging != null)
-      .map(day => ({
-        position: { lat: day.lodging!.lat, lng: day.lodging!.lon },
-        name: day.lodging!.name,
-      }));
+    // lodging_options carries every candidate shown for the night (selected
+    // included) — use it when present. Older snapshots (finalized before
+    // this field existed) have lodging_options=[] for every day; fall back
+    // to the single `lodging` field so they still show their one marker,
+    // same as before this feature existed. Factored into a function (not
+    // inlined) because day isolation below needs the SAME mapping over a
+    // different, smaller set of days (just the isolated one plus whichever
+    // precedes it) — never duplicate the per-option field mapping.
+    const buildLodgingMarkers = (days: typeof finalizedTrip.days) => days.flatMap(day => {
+      if (day.lodging_options.length > 0) {
+        return day.lodging_options.map(opt => ({
+          position: { lat: opt.lat, lng: opt.lon },
+          name: opt.name,
+          placeId: opt.place_id,
+          rating: opt.rating,
+          userRatingsTotal: opt.user_ratings_total,
+          priceLevel: opt.price_level,
+          vicinity: opt.vicinity,
+          mapsUrl: opt.maps_url,
+          selected: opt.selected,
+        }));
+      }
+      if (day.lodging) {
+        return [{
+          position: { lat: day.lodging.lat, lng: day.lodging.lon },
+          name: day.lodging.name,
+          placeId: day.lodging.place_id,
+          rating: day.lodging.rating,
+          userRatingsTotal: null,
+          priceLevel: null,
+          vicinity: day.lodging.vicinity,
+          mapsUrl: day.lodging.maps_url,
+          selected: true,
+        }];
+      }
+      return [];
+    });
+    lodgingMarkersForMap = buildLodgingMarkers(finalizedTrip.days);
+
+    // Day isolation: show only day N's own polyline segments/stops, plus
+    // the lodging that bounds it (its own overnight as the exit, the
+    // PREVIOUS day's overnight as the entry — otherwise the isolated
+    // segment visually hangs with no start point) and the day-boundary
+    // badge for its own start, if it has one. Start/finish pins hidden
+    // unless N is genuinely the first/last day of the whole trip. The
+    // round-trip pivot X is never a discrete marker of its own (see the
+    // waypoints comment above) — it's already just part of whichever day's
+    // polyline segment it falls in, nothing extra to filter for it.
+    if (isolatedDay !== null) {
+      const dayIdx = finalizedTrip.days.findIndex(d => d.day === isolatedDay);
+      if (dayIdx !== -1) {
+        const isFirstDay = dayIdx === 0;
+        const isLastDay = dayIdx === finalizedTrip.days.length - 1;
+
+        activeDaySegments = activeDaySegments.filter(seg => seg.dayNumber === isolatedDay);
+        dayBoundaryMarkersForMap = dayBoundaryMarkersForMap.filter(m => m.label === `Д${isolatedDay}`);
+        planMarkersForMap = planMarkersForMap.filter((_, idx) => stopIndexToDay.get(idx) === dayIdx);
+
+        const lodgingSourceDays = isFirstDay
+          ? [finalizedTrip.days[dayIdx]]
+          : [finalizedTrip.days[dayIdx - 1], finalizedTrip.days[dayIdx]];
+        lodgingMarkersForMap = buildLodgingMarkers(lodgingSourceDays);
+
+        if (!isFirstDay) originCoordForMap = null;
+        if (!isLastDay) destCoordForMap = null;
+      }
+    }
   } else {
     planRouteLinesForMap = options.map((option, idx) => {
       const isActive = idx === activeOptionIndex;
@@ -1916,8 +2051,8 @@ export default function App() {
               phase={phase}
               generationStep={generationStep}
               routeLine={routeLine}
-              originCoord={originCoord}
-              destCoord={destCoord}
+              originCoord={originCoordForMap}
+              destCoord={destCoordForMap}
               onOriginDragEnd={(lat, lng) => handleMarkerDragEnd('origin', lat, lng)}
               onDestDragEnd={(lat, lng) => handleMarkerDragEnd('dest', lat, lng)}
               pickingField={pickingField}
@@ -1931,8 +2066,11 @@ export default function App() {
               highlightedDay={hoveredMapDay}
               selectedStopId={selectedStopId}
               onSelectStop={handleSelectStop}
-              onClosePopup={() => setSelectedStopId(null)}
+              selectedLodgingPlaceId={selectedLodgingPlaceId}
+              onSelectLodging={handleSelectLodging}
+              onClosePopup={() => { setSelectedStopId(null); setSelectedLodgingPlaceId(null); }}
               onToggleStop={handleToggleStop}
+              isolatedActive={isolatedDay !== null}
             />
           </div>
 
@@ -1962,6 +2100,7 @@ export default function App() {
               onSelectStop={handleSelectStop}
               onEditDraft={handleEditDraftFromFinalized}
               onDayHover={setHoveredMapDay}
+              onIsolateDayChange={setIsolatedDay}
             />
           )}
         </main>

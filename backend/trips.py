@@ -40,6 +40,7 @@ async def save_draft(
     destination: tuple[float, float] | None,
     quiz_answers: dict | None,
     draft_state: dict | None,
+    owner_user_id: uuid.UUID | None = None,
 ) -> dict:
     """Creates a new draft (trip_project_id is None) or updates an existing
     one — but an update only ever touches a row this session already owns
@@ -47,7 +48,18 @@ async def save_draft(
     resolve under that filter — wrong session, or never existed — raises
     TripAccessError rather than silently creating a new row or updating
     someone else's; the frontend must never be trusted to send back an id
-    that's actually its own."""
+    that's actually its own.
+
+    owner_user_id: the caller's session.user_id at creation time — None for
+    an anonymous session (row stays ownerless until claim_session_for_google_user
+    backfills it at login, see auth.py), set immediately when the session
+    creating the project is ALREADY logged in. Without this, a project
+    created by an already-logged-in user would never get an owner at all —
+    claim only ever fires on the LOGIN event, which doesn't happen again for
+    someone already signed in — and finalize.py's strict owner_user_id check
+    would never find it. Only used on CREATE; an update never touches
+    ownership, same as before.
+    """
     pool = await get_pool()
     origin_lat, origin_lon = origin if origin else (None, None)
     dest_lat, dest_lon = destination if destination else (None, None)
@@ -57,13 +69,13 @@ async def save_draft(
             row = await conn.fetchrow(
                 """
                 INSERT INTO app.trip_projects
-                    (anonymous_session_id, status, title, origin_name, destination_name,
+                    (anonymous_session_id, owner_user_id, status, title, origin_name, destination_name,
                      origin_lat, origin_lon, destination_lat, destination_lon,
                      quiz_answers, draft_state)
-                VALUES ($1, 'draft', $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb)
+                VALUES ($1, $2, 'draft', $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)
                 RETURNING id, updated_at
                 """,
-                session_id, title, origin_name, destination_name,
+                session_id, owner_user_id, title, origin_name, destination_name,
                 origin_lat, origin_lon, dest_lat, dest_lon,
                 _dump_json(quiz_answers), _dump_json(draft_state),
             )

@@ -16,6 +16,7 @@ const lodging = (placeId: string, lat: number, lon: number): FinalizedLodging =>
 
 const day = (n: number, stopIndices: number[], lodging: FinalizedLodging | null): FinalizedDay => ({
   day: n, stop_indices: stopIndices, drive_s: 0, visit_s: 0, total_s: 0, over_limit: false, lodging,
+  lodging_options: [],
 });
 
 const tripStart = { lat: 39.7392, lon: -104.9903 };
