@@ -828,6 +828,99 @@ async def test_build_finalize_preview_single_day_skips_lodging_search():
     mock_lodging.assert_not_called()
 
 
+# --- Re-lodge preview (already-finalized trip): reuses the snapshot's exact
+# day boundaries, never re-runs Valhalla/day_split -----------------------
+
+def _fake_finalized_snapshot(days: list[dict], round_trip: bool = False) -> dict:
+    return {
+        "origin": {"name": "Denver", "lat": 39.7392, "lon": -104.9903},
+        "destination": {"name": "Durango", "lat": 37.2753, "lon": -107.8801},
+        "stops": [
+            {"id": 1, "name": "Stop 1", "category": "Nature & Parks", "rating": 4.5,
+             "review_count": 10, "lat": 39.1, "lon": -105.1, "detour_s": 300,
+             "why": "x", "tips": None, "dates_note": None, "leg": None},
+            {"id": 2, "name": "Stop 2", "category": "Nature & Parks", "rating": 4.2,
+             "review_count": 8, "lat": 38.5, "lon": -106.5, "detour_s": 300,
+             "why": "x", "tips": None, "dates_note": None, "leg": None},
+        ],
+        "route": {"duration_s": 30000, "distance_km": 300.0, "shape": "shape", "legs": []},
+        "days": days,
+        "day_plan": {"requested": None, "actual": len(days), "flexible": True, "over_plan": False},
+        "enrichment": {"overview": "", "warnings": [], "sources": []},
+        "trip_dates": None,
+        "finalized_at": "2026-01-01T00:00:00+00:00",
+        "round_trip": round_trip,
+    }
+
+
+async def test_build_relodge_preview_reuses_snapshot_boundaries_no_valhalla_call():
+    """Day boundaries/numbers come straight from the finalized snapshot
+    (Google-exact) — build_route_through/day_split must never be called;
+    only the lodging-search half runs, at each day's already-known
+    end_point."""
+    days = [
+        {"day": 1, "stop_indices": [0], "drive_s": 5000, "visit_s": 3600, "total_s": 8600, "over_limit": False,
+         "lodging": None, "lodging_options": []},
+        {"day": 2, "stop_indices": [1], "drive_s": 9000, "visit_s": 3600, "total_s": 12600, "over_limit": False,
+         "lodging": None, "lodging_options": []},
+    ]
+    snapshot = _fake_finalized_snapshot(days)
+    high_rated = {"place_id": "p_high", "name": "High Rated Lodge", "lat": 0, "lon": 0,
+                  "rating": 4.8, "user_ratings_total": 300, "price_level": 3,
+                  "vicinity": "town center", "maps_url": "url_high", "distance_m": 2000}
+
+    with patch("services.stops.build_route_through", new=AsyncMock()) as mock_through, \
+         patch("services.stops.build_route_through_round_trip", new=AsyncMock()) as mock_through_rt, \
+         patch("day_split.split_into_days") as mock_split, \
+         patch("accommodations.find_nearest_lodging", new=AsyncMock(return_value=[high_rated])) as mock_lodging:
+        preview = await finalize.build_relodge_preview(snapshot, quiz_answers={"drive": "до 4 ч", "detour": "до 30 мин"})
+
+    mock_through.assert_not_called()
+    mock_through_rt.assert_not_called()
+    mock_split.assert_not_called()
+
+    assert preview["preliminary"] is True
+    assert len(preview["days"]) == 2
+
+    day1 = preview["days"][0]
+    # Exact numbers preserved byte-for-byte from the snapshot -- never
+    # recomputed.
+    assert day1["stop_indices"] == [0]
+    assert day1["drive_s"] == 5000
+    assert day1["total_s"] == 8600
+    assert day1["end_point"] == {"lat": 39.1, "lon": -105.1, "near_stop_name": "Stop 1"}
+    assert [o["place_id"] for o in day1["lodging_options"]] == ["p_high"]
+
+    day2 = preview["days"][1]
+    assert day2["end_point"] == {"lat": 37.2753, "lon": -107.8801, "near_stop_name": None}
+    assert day2["lodging_options"] == []  # last day never searched
+
+    assert preview["has_lodging"] is True
+    assert preview["needs_selection"] is True
+
+    # Radius still comes from the quiz answer, same mapping as build_finalize_preview.
+    mock_lodging.assert_called_once_with(39.1, -105.1, 30000, limit=20)
+
+
+async def test_build_relodge_preview_round_trip_last_day_ends_at_origin():
+    days = [
+        {"day": 1, "stop_indices": [0, 1], "drive_s": 20000, "visit_s": 7200, "total_s": 27200, "over_limit": False,
+         "lodging": None, "lodging_options": []},
+    ]
+    snapshot = _fake_finalized_snapshot(days, round_trip=True)
+
+    with patch("services.stops.build_route_through", new=AsyncMock()) as mock_through, \
+         patch("accommodations.find_nearest_lodging", new=AsyncMock(return_value=[])):
+        preview = await finalize.build_relodge_preview(snapshot, quiz_answers=None)
+
+    mock_through.assert_not_called()
+    # Single day IS the last day -> ends at origin (the loop closes there),
+    # never the snapshot's `destination` (that's only the pivot X).
+    assert preview["days"][0]["end_point"] == {"lat": 39.7392, "lon": -104.9903, "near_stop_name": None}
+    assert preview["days"][0]["lodging_options"] == []
+    assert preview["needs_selection"] is False  # single day, no night follows it
+
+
 # --- Фаза ночёвок, подшаг 3: paid finalize with a lodging selection ---------
 
 async def test_process_finalization_with_selected_lodging_inserts_waypoints(cleanup):
@@ -910,7 +1003,7 @@ async def test_process_finalization_with_selected_lodging_inserts_waypoints(clea
     assert day1["lodging"] == {
         "place_id": "lodge123", "name": "Mountain Inn", "lat": 39.15, "lon": -105.15,
         "maps_url": "https://www.google.com/maps/place/?q=place_id:lodge123",
-        "rating": 4.6, "vicinity": "123 Alpine Way, Ouray",
+        "rating": 4.6, "vicinity": "123 Alpine Way, Ouray", "custom": False,
     }
 
     assert day2["stop_indices"] == [1]
@@ -1021,6 +1114,93 @@ async def test_process_finalization_carries_full_lodging_options_into_snapshot(c
     assert day2["lodging_options"] == []
 
 
+async def test_process_finalization_with_custom_lodging_point(cleanup):
+    """A custom (non-Places) lodging point — place_id=None, custom=True —
+    must route exactly like a Places pick (same waypoint insertion, no
+    special-casing in _build_route_detail_with_lodging), land in the
+    snapshot with custom=True and a coordinate-based maps_url fallback (no
+    place_id to build a Places-style link from), and must NOT cause any
+    Places candidate shown for that night to be marked selected."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        user_id = await _make_user(conn, balance=1)
+        trip_id = await _make_trip_with_draft(conn, user_id)
+    cleanup["users"].append(user_id)
+    cleanup["trip_projects"].append(trip_id)
+
+    fake_through = {
+        "legs": [
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 10000, "distance_km": 50.0},
+            {"duration_s": 5000, "distance_km": 20.0},
+        ],
+        "total_s": 25000, "distance_km": 120.0, "route_shape": "valhalla_shape",
+    }
+    fake_google_result = {
+        "duration_s": 14000, "distance_km": 100.0, "shape": "google_shape_with_lodging",
+        "legs": [
+            {"duration_s": 2000, "distance_km": 10.0},
+            {"duration_s": 3000, "distance_km": 15.0},
+            {"duration_s": 4000, "distance_km": 20.0},
+            {"duration_s": 5000, "distance_km": 25.0},
+        ],
+    }
+    fake_baseline = {"duration_s": 12000, "distance_km": 90.0, "shape": "baseline_shape", "legs": []}
+
+    calls: list[list] = []
+
+    async def fake_get_directions(origin, destination, waypoints=None):
+        calls.append(waypoints)
+        return fake_google_result if waypoints else fake_baseline
+
+    selected_lodging = [{
+        "day": 1, "place_id": None, "lat": 39.17, "lon": -105.17, "name": "Своя точка у озера",
+        "rating": None, "vicinity": None, "custom": True,
+    }]
+    # Places had real candidates for day 1 — none of them was picked.
+    lodging_options_by_day = [
+        {"day": 1, "options": [
+            {"place_id": "lodge123", "name": "Mountain Inn", "lat": 39.15, "lon": -105.15,
+             "rating": 4.6, "user_ratings_total": 300, "price_level": 2,
+             "vicinity": "123 Alpine Way, Ouray", "maps_url": "https://maps/lodge123"},
+        ]},
+    ]
+
+    job = await finalize.start_finalization(user_id, uuid.uuid4(), trip_id, idempotency_key=str(uuid.uuid4()))
+
+    with patch("services.stops.build_route_through", new=AsyncMock(return_value=fake_through)), \
+         patch("directions.get_directions", new=AsyncMock(side_effect=fake_get_directions)), \
+         patch("enrichment.enrich_route", new=AsyncMock(return_value=_FAKE_ENRICH_RESULT)):
+        await finalize.process_finalization(job.id, selected_lodging, lodging_options_by_day)
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        job_row = await conn.fetchrow(
+            "SELECT status, trip_version_id FROM app.finalization_jobs WHERE id = $1", job.id
+        )
+        assert job_row["status"] == "done"
+        snapshot = json.loads(await conn.fetchval(
+            "SELECT snapshot FROM app.trip_versions WHERE id = $1", job_row["trip_version_id"]
+        ))
+
+    # Routed through the custom point's coordinates exactly like a Places pick.
+    routed_waypoints = calls[0]
+    assert routed_waypoints[1] == (39.17, -105.17)
+
+    day1, day2 = snapshot["days"]
+    assert day1["lodging"] == {
+        "place_id": None, "name": "Своя точка у озера", "lat": 39.17, "lon": -105.17,
+        "maps_url": "https://www.google.com/maps/search/?api=1&query=39.17,-105.17",
+        "rating": None, "vicinity": None, "custom": True,
+    }
+    assert day2["lodging"] is None
+
+    # The Places candidate shown for day 1 must NOT be marked selected —
+    # the custom point isn't in this list at all (it wasn't a preview candidate).
+    assert [o["place_id"] for o in day1["lodging_options"]] == ["lodge123"]
+    assert day1["lodging_options"][0]["selected"] is False
+
+
 def test_sanitize_lodging_options_by_day_drops_malformed_entries():
     selected = {1: "good-id"}
     raw = [
@@ -1061,6 +1241,95 @@ def test_sanitize_lodging_options_by_day_none_or_wrong_type_returns_empty():
     assert finalize._sanitize_lodging_options_by_day(None, {}) == {}
     assert finalize._sanitize_lodging_options_by_day("not-a-list", {}) == {}
     assert finalize._sanitize_lodging_options_by_day([], {}) == {}
+
+
+def test_sanitize_lodging_options_by_day_custom_pick_marks_no_places_option_selected():
+    """A custom (non-Places) lodging pick has place_id=None in
+    selected_place_id_by_day — must never match a candidate via None==None,
+    explicit or otherwise (see the `is not None` guard)."""
+    result = finalize._sanitize_lodging_options_by_day(
+        [{"day": 1, "options": [
+            {"place_id": "p1", "name": "Inn One", "lat": 1.0, "lon": 2.0},
+            {"place_id": "p2", "name": "Inn Two", "lat": 1.1, "lon": 2.1},
+        ]}],
+        {1: None},
+    )
+
+    assert [o["selected"] for o in result[1]] == [False, False]
+
+
+def test_selected_lodging_in_accepts_null_place_id():
+    """main.SelectedLodgingIn (the finalize endpoint's request model) must
+    accept a custom point: place_id omitted/None, custom=True."""
+    import main
+
+    parsed = main.SelectedLodgingIn(day=1, lat=39.1, lon=-105.1, name="Своя точка", custom=True)
+    assert parsed.place_id is None
+    assert parsed.custom is True
+    assert parsed.model_dump() == {
+        "day": 1, "place_id": None, "lat": 39.1, "lon": -105.1, "name": "Своя точка",
+        "rating": None, "vicinity": None, "custom": True,
+    }
+
+
+def _finalized_snapshot_stub(lodging_day1: dict | None) -> dict:
+    """Minimal-but-complete FinalizedTripOut-shaped dict — just enough to
+    exercise main.FinalizedTripOut's own validation, not a real pipeline run."""
+    return {
+        "origin": {"name": "Denver", "lat": 39.7, "lon": -104.9},
+        "destination": {"name": "Durango", "lat": 37.3, "lon": -107.9},
+        "stops": [],
+        "route": {"duration_s": 100, "distance_km": 10.0, "shape": "abc", "legs": []},
+        "days": [
+            {"day": 1, "stop_indices": [], "drive_s": 0, "visit_s": 0, "total_s": 0,
+             "over_limit": False, "lodging": lodging_day1, "lodging_options": []},
+            {"day": 2, "stop_indices": [], "drive_s": 0, "visit_s": 0, "total_s": 0,
+             "over_limit": False, "lodging": None, "lodging_options": []},
+        ],
+        "day_plan": {"requested": None, "actual": 2, "flexible": True, "over_plan": False},
+        "enrichment": {"overview": "", "warnings": [], "sources": []},
+        "trip_dates": None,
+        "finalized_at": "2026-01-01T00:00:00+00:00",
+        "round_trip": False,
+    }
+
+
+def test_finalized_trip_out_accepts_custom_lodging_snapshot():
+    """The exact shape finalize.py writes for a custom (non-Places) lodging
+    pick — place_id/rating/vicinity all None, custom=True — must parse
+    through main.FinalizedTripOut without a validation error (this is what
+    GET /trips/{id}/finalized does). Regression: place_id was `str`
+    (required), not `str | None`, so this raised a 500 on read even though
+    POST /finalize itself had already succeeded."""
+    import main
+
+    snapshot = _finalized_snapshot_stub({
+        "place_id": None, "name": "Своя точка", "lat": 39.75, "lon": -104.95,
+        "maps_url": "https://www.google.com/maps/search/?api=1&query=39.75,-104.95",
+        "rating": None, "vicinity": None, "custom": True,
+    })
+
+    out = main.FinalizedTripOut(**snapshot, is_first_finalize=False)
+    assert out.days[0].lodging.place_id is None
+    assert out.days[0].lodging.custom is True
+
+
+def test_finalized_trip_out_still_accepts_pre_custom_lodging_snapshot():
+    """A snapshot finalized before this feature existed never had a `custom`
+    key on lodging at all, and place_id was always a real string — must
+    still parse, with custom defaulting to False."""
+    import main
+
+    snapshot = _finalized_snapshot_stub({
+        "place_id": "lodge123", "name": "Mountain Inn", "lat": 39.15, "lon": -105.15,
+        "maps_url": "https://www.google.com/maps/place/?q=place_id:lodge123",
+        "rating": 4.6, "vicinity": "123 Alpine Way",
+        # no "custom" key -- matches a real pre-feature snapshot
+    })
+
+    out = main.FinalizedTripOut(**snapshot, is_first_finalize=False)
+    assert out.days[0].lodging.place_id == "lodge123"
+    assert out.days[0].lodging.custom is False
 
 
 # --- day_plan: derived from finished snapshot.days, not get_route_detail ---

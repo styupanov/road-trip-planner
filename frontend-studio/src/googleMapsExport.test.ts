@@ -11,7 +11,7 @@ const stop = (id: number, lat: number, lon: number): FinalizedStop => ({
 });
 
 const lodging = (placeId: string, lat: number, lon: number): FinalizedLodging => ({
-  place_id: placeId, name: 'Hotel', lat, lon, maps_url: '', rating: null, vicinity: null,
+  place_id: placeId, name: 'Hotel', lat, lon, maps_url: '', rating: null, vicinity: null, custom: false,
 });
 
 const day = (n: number, stopIndices: number[], lodging: FinalizedLodging | null): FinalizedDay => ({

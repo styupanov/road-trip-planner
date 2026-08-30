@@ -66,6 +66,11 @@ export interface TripMapProps {
   onDestDragEnd: (lat: number, lng: number) => void;
   pickingField: 'origin' | 'dest' | null;
   onMapClick: (lat: number, lng: number) => void;
+  // Independent of pickingField (which is quiz-only, see App.tsx) — true
+  // while LodgingSelectionModal's "Выбрать на карте" is active for some day.
+  // Only affects cursor/hint here; the actual click is still routed through
+  // onMapClick, App.tsx's own handler tells the two modes apart.
+  pickingLodging?: boolean;
   // Phase 'plan' route overlay: every option's base line at once, the active
   // option's line accented (and swapped for its live through-route by the caller).
   planRouteLines: Array<{ points: Array<{ lat: number; lng: number }>; isActive: boolean }>;
@@ -423,6 +428,38 @@ const MapController: React.FC<{
     }
   }, [map, selectedStopId, planMarkers]);
 
+  // Google Maps' own canvas doesn't redraw itself when its CONTAINER's pixel
+  // size changes for a reason it doesn't know about (a CSS layout change —
+  // e.g. this app's map-on-top editor layout vs the side-by-side quiz/
+  // refine one, both using the SAME long-lived <Map> instance, see App.tsx's
+  // own comment on why MapComponent never remounts across that transition).
+  // @vis.gl/react-google-maps has no built-in handling for this (checked its
+  // dist bundle directly — no ResizeObserver, no resize-event trigger
+  // anywhere in the library), so it's on the consumer. A ResizeObserver on
+  // the map's own container, not a specific prop, so this covers every
+  // future container-size change (window resize, a future layout tweak),
+  // not just this one migration step.
+  //
+  // Recenters to the SAME center after resizing (never a NEW one) purely to
+  // counter a well-known Maps quirk where the visual center drifts a few
+  // pixels after its canvas is resized — this is not an autofit and never
+  // conflicts with isolatedActive's "don't move the camera" guarantee
+  // above: same center in, same center out, no bounds computed.
+  useEffect(() => {
+    if (!map || !window.google) return;
+    const container = map.getDiv();
+    if (!container) return;
+
+    const observer = new ResizeObserver(() => {
+      window.google.maps.event.trigger(map, 'resize');
+      const center = map.getCenter();
+      if (center) map.setCenter(center);
+    });
+    observer.observe(container);
+
+    return () => observer.disconnect();
+  }, [map]);
+
   return null;
 };
 
@@ -435,6 +472,7 @@ export const TripMap: React.FC<TripMapProps> = ({
   onDestDragEnd,
   pickingField,
   onMapClick,
+  pickingLodging = false,
   planRouteLines,
   planMarkers,
   activeDaySegments,
@@ -485,7 +523,7 @@ export const TripMap: React.FC<TripMapProps> = ({
           mapTypeControl={false}
           streetViewControl={false}
           fullscreenControl={false}
-          draggableCursor={pickingField ? 'crosshair' : undefined}
+          draggableCursor={pickingField || pickingLodging ? 'crosshair' : undefined}
           onZoomChanged={(e) => setZoom(e.detail.zoom)}
           onClick={(e) => {
             // Fires on a plain map click; Google Maps does not re-fire this for marker
@@ -710,7 +748,7 @@ export const TripMap: React.FC<TripMapProps> = ({
         </Map>
 
         {/* Map picking mode hint */}
-        {pickingField && (
+        {(pickingField || pickingLodging) && (
           <div
             style={{
               position: 'absolute',
@@ -726,7 +764,9 @@ export const TripMap: React.FC<TripMapProps> = ({
               pointerEvents: 'none',
             }}
           >
-            {pickingField === 'origin'
+            {pickingLodging
+              ? 'Кликните, чтобы поставить точку ночёвки'
+              : pickingField === 'origin'
               ? 'Кликните, чтобы поставить точку старта'
               : 'Кликните, чтобы поставить точку финиша'}
           </div>

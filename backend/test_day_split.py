@@ -1,6 +1,14 @@
-import pytest
+import json
 
+import pytest
+from fastapi import HTTPException
+
+import db
+import finalize
+import main
 from day_split import split_into_days
+
+pytestmark = pytest.mark.anyio
 
 
 def leg(duration_s):
@@ -177,3 +185,139 @@ def test_round_trip_durango_leadville_no_longer_inflates_to_six_days():
     # the fix actually enables packing across stops, not just a smaller
     # number by coincidence.
     assert [len(d["stop_indices"]) for d in days] == [1, 1, 1, 2, 1]
+
+
+# --- POST /day-split (main.py): thin wrapper, no new algorithm ------------
+# Шаг 0 of the trip-editor UI migration — a pure-arithmetic day-split for
+# the DRAFT, before any credit is spent. These tests exercise the ENDPOINT
+# (request parsing, pace -> awake_limit_s resolution, error mapping), not
+# the algorithm itself — that's already covered exhaustively above.
+
+async def test_day_split_endpoint_matches_split_into_days_directly():
+    """The endpoint must be byte-for-byte the same as calling
+    split_into_days directly with the same inputs — no second
+    implementation, no drift."""
+    legs = [7178, 13958, 8343, 8545, 4856, 4115, 6827]
+    req = main.DaySplitRequest(
+        legs=[main.DaySplitLegIn(duration_s=d) for d in legs],
+        stop_count=6,
+        daily_limit_s=14400,
+        pace="balanced",
+        visit_s=3600,
+    )
+
+    result = await main.day_split_endpoint(req)
+
+    expected = split_into_days(
+        [leg(d) for d in legs], stop_count=6, daily_limit_s=14400, visit_s=3600, awake_limit_s=43200,
+    )
+    assert [d.model_dump() for d in result.days] == expected
+
+
+async def test_day_split_endpoint_derives_awake_limit_from_pace():
+    """Same reasoning as test_awake_limit_varies_by_pace_changes_day_count
+    above, but through the endpoint's pace param — must resolve via
+    services.stops.awake_limit_s_for_pace, the SAME function
+    finalize.build_finalize_preview uses, not a second mapping."""
+    legs = [3600] * 12 + [0]
+
+    def make_req(pace: str) -> main.DaySplitRequest:
+        return main.DaySplitRequest(
+            legs=[main.DaySplitLegIn(duration_s=d) for d in legs],
+            stop_count=12,
+            daily_limit_s=100 * 3600,
+            pace=pace,
+            visit_s=3600,
+        )
+
+    relaxed = await main.day_split_endpoint(make_req("relaxed"))
+    packed = await main.day_split_endpoint(make_req("packed"))
+
+    assert [len(d.stop_indices) for d in relaxed.days] == [5, 5, 2]
+    assert [len(d.stop_indices) for d in packed.days] == [7, 5]
+
+
+async def test_day_split_endpoint_defaults_to_balanced_pace():
+    req = main.DaySplitRequest(
+        legs=[main.DaySplitLegIn(duration_s=100), main.DaySplitLegIn(duration_s=0)],
+        stop_count=1,
+        daily_limit_s=28800,
+    )
+    assert req.pace == "balanced"
+    assert req.visit_s == 3600
+    # Should not raise -- confirms the defaults alone are enough to run.
+    await main.day_split_endpoint(req)
+
+
+async def test_day_split_endpoint_mismatched_legs_raises_400():
+    """split_into_days' own ValueError (legs length != stop_count + 1) must
+    surface as a 400, not an unhandled 500."""
+    req = main.DaySplitRequest(
+        legs=[main.DaySplitLegIn(duration_s=100), main.DaySplitLegIn(duration_s=100)],
+        stop_count=5,
+        daily_limit_s=28800,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await main.day_split_endpoint(req)
+    assert exc_info.value.status_code == 400
+
+
+async def test_day_split_endpoint_real_finalized_snapshot():
+    """Empirical, not just algorithmic: feeding a REAL finalized (no-
+    lodging) trip's exact Google-measured route.legs + the same quiz-derived
+    limits back into /day-split must reproduce that trip's snapshot.days
+    exactly. For a one-way trip route.legs is exactly what
+    directions.get_route_detail ran split_into_days on; for a round trip,
+    get_route_detail_round_trip's own docstring guarantees route.legs IS the
+    merged, pivot-as-ordinary-waypoint sequence day_split.split_into_days
+    was actually run on (length stop_count + 1, pivot excluded from
+    stop_count) — the same list, not an approximation of it. Only a trip
+    with NO lodging qualifies: a lodging pick inserts extra waypoints into
+    route.legs that aren't part of stop_count, breaking the length match.
+    """
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT tp.quiz_answers, tv.snapshot
+            FROM app.trip_projects tp
+            JOIN app.trip_versions tv ON tv.id = tp.finalized_version_id
+            WHERE tp.status = 'finalized'
+            ORDER BY tv.created_at DESC
+            LIMIT 50
+            """
+        )
+
+    snapshot = None
+    quiz_answers = None
+    for row in rows:
+        candidate = json.loads(row["snapshot"])
+        if not any(d.get("lodging") for d in candidate["days"]):
+            snapshot = candidate
+            quiz_answers = json.loads(row["quiz_answers"]) if row["quiz_answers"] else {}
+            break
+    if snapshot is None:
+        pytest.skip("no finalized, lodging-free trip in this database to verify against")
+
+    daily_limit_s = finalize._daily_limit_s_from_quiz(quiz_answers)
+    pace = finalize._pace_from_quiz(quiz_answers)
+
+    req = main.DaySplitRequest(
+        legs=[main.DaySplitLegIn(duration_s=leg["duration_s"]) for leg in snapshot["route"]["legs"]],
+        stop_count=len(snapshot["stops"]),
+        daily_limit_s=daily_limit_s,
+        pace=pace,
+        visit_s=3600,
+    )
+    result = await main.day_split_endpoint(req)
+
+    got = [
+        {k: getattr(d, k) for k in ("day", "stop_indices", "drive_s", "visit_s", "total_s", "over_limit")}
+        for d in result.days
+    ]
+    expected = [
+        {k: d[k] for k in ("day", "stop_indices", "drive_s", "visit_s", "total_s", "over_limit")}
+        for d in snapshot["days"]
+    ]
+    assert got == expected

@@ -12,6 +12,7 @@ from pydantic import BaseModel
 import routing
 import geocoding
 import directions
+import day_split
 import enrichment
 import sessions
 import trips
@@ -332,9 +333,30 @@ async def finalize_preview(trip_id: uuid.UUID, session: sessions.Session = Depen
         raise HTTPException(status_code=503, detail="Valhalla routing service unavailable")
 
 
+# Re-lodge (add/change nights on an ALREADY-finalized trip, FinalizedView's
+# "Добавить/Изменить ночёвки"): same response shape as finalize-preview
+# above, but reuses the CURRENT finalized snapshot's exact (Google-computed)
+# day boundaries instead of re-running Valhalla/day_split — see
+# finalize.build_relodge_preview. No Valhalla call here, so none of
+# finalize_preview's routing-error handling applies; a lodging-search hiccup
+# for one night degrades to an empty options list for that night instead
+# (same as finalize_preview, inside _attach_lodging_options), never a 500.
+@app.post("/trips/{trip_id}/relodge-preview", response_model=FinalizePreviewResponse)
+async def relodge_preview(trip_id: uuid.UUID, session: sessions.Session = Depends(sessions.get_session)):
+    if session.user_id is None:
+        raise HTTPException(status_code=401, detail="Требуется вход.")
+    snapshot = await finalize.get_finalized_snapshot(session.id, session.user_id, trip_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Финализированная версия не найдена.")
+    trip = await trips.get_trip_for_session(session.id, session.user_id, trip_id)
+    quiz_answers = trip["quiz_answers"] if trip else None
+    return await finalize.build_relodge_preview(snapshot, quiz_answers)
+
+
 class SelectedLodgingIn(BaseModel):
     day: int
-    place_id: str
+    # None for a custom (non-Places) point entered by the user — see `custom`.
+    place_id: str | None = None
     lat: float
     lon: float
     name: str
@@ -345,6 +367,9 @@ class SelectedLodgingIn(BaseModel):
     # just without these two in the snapshot's lodging block.
     rating: float | None = None
     vicinity: str | None = None
+    # True when the user entered/picked their own point instead of a Places
+    # candidate (LodgingSelectionModal's "Указать своё место").
+    custom: bool = False
 
 
 class FinalizeRequest(BaseModel):
@@ -673,6 +698,61 @@ async def detail_route(req: DetailRouteRequest):
         raise HTTPException(status_code=503, detail="Google Directions service unavailable")
 
 
+class DaySplitLegIn(BaseModel):
+    # Only field day_split.split_into_days actually reads (see its own
+    # module) — deliberately not the full RouteLeg shape (from_index/
+    # to_index/distance_km) the frontend already has from /route-through;
+    # this endpoint is honest about what it uses.
+    duration_s: int
+
+
+class DaySplitRequest(BaseModel):
+    # Same length requirement as day_split.split_into_days itself: stop_count + 1.
+    legs: list[DaySplitLegIn]
+    stop_count: int
+    daily_limit_s: int
+    # Same pace -> awake_limit_s resolution as /stops, /detail-route,
+    # /compare-routes (stops_service.awake_limit_s_for_pace) and
+    # finalize.build_finalize_preview — one place maps pace to a ceiling,
+    # not a second one invented here.
+    pace: Literal["relaxed", "balanced", "packed"] = "balanced"
+    visit_s: int = 3600
+
+
+class DaySplitResponse(BaseModel):
+    days: list[DayOut]
+
+
+# Шаг 0 переработки UI редактора (план миграции): pure arithmetic day-split
+# for the DRAFT, so the day ribbon has something to show before any credit
+# is spent — no Google/Valhalla/DB call, no ownership check, no billing.
+# Reuses day_split.split_into_days AS IS (see its own module) — this is the
+# ONLY call site besides directions.py/finalize.py, never a second
+# implementation of the two-ceiling greedy algorithm.
+#
+# No ownership check on purpose, matching /stops, /route-through,
+# /detail-route, /compare-routes: none of those check session ownership
+# either, because none of them read a persisted per-user resource — they're
+# pure computation over whatever the caller sends in the request body. This
+# endpoint is the same shape: legs/stop_count/limits are arbitrary numbers,
+# not a trip_project_id, so there's nothing here to own. Contrast with
+# finalize-preview/relodge-preview, which DO check ownership because they
+# read a specific trip's draft_state/snapshot from the DB.
+@app.post("/day-split", response_model=DaySplitResponse)
+async def day_split_endpoint(req: DaySplitRequest):
+    try:
+        days = day_split.split_into_days(
+            legs=[leg.model_dump() for leg in req.legs],
+            stop_count=req.stop_count,
+            daily_limit_s=req.daily_limit_s,
+            visit_s=req.visit_s,
+            awake_limit_s=stops_service.awake_limit_s_for_pace(req.pace),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return DaySplitResponse(days=days)
+
+
 class EnrichStopIn(BaseModel):
     id: int
     name: str
@@ -777,13 +857,18 @@ class FinalizedEnrichmentOut(BaseModel):
 
 
 class FinalizedLodgingOut(BaseModel):
-    place_id: str
+    # None for a custom (non-Places) point — see `custom` below. Was `str`
+    # (required) before that feature existed; a real place_id is still a str.
+    place_id: str | None
     name: str
     lat: float
     lon: float
     maps_url: str
     rating: float | None
     vicinity: str | None
+    # Default so a trip_versions.snapshot finalized before this field existed
+    # still parses — same backward-compat pattern as lodging_options below.
+    custom: bool = False
 
 
 # Same fields as LodgingOptionOut (finalize-preview's own candidate shape)

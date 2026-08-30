@@ -15,6 +15,9 @@ interface MapComponentProps {
   onDestDragEnd: (lat: number, lng: number) => void;
   pickingField: 'origin' | 'dest' | null;
   onMapClick: (lat: number, lng: number) => void;
+  // See TripMap's own prop comment — independent of pickingField, drives
+  // cursor/hint only, while a custom lodging point is being picked on the map.
+  pickingLodging?: boolean;
   planRouteLines: Array<{ points: Array<{ lat: number; lng: number }>; isActive: boolean }>;
   planMarkers: PlanMapMarker[];
   // Day-colored replacement for the active option's line in planRouteLines —
@@ -54,6 +57,7 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   onDestDragEnd,
   pickingField,
   onMapClick,
+  pickingLodging = false,
   planRouteLines,
   planMarkers,
   activeDaySegments,
@@ -86,6 +90,7 @@ export const MapComponent: React.FC<MapComponentProps> = ({
         onDestDragEnd={onDestDragEnd}
         pickingField={pickingField}
         onMapClick={onMapClick}
+        pickingLodging={pickingLodging}
         planRouteLines={showOverlay ? planRouteLines : []}
         planMarkers={showOverlay ? planMarkers : []}
         activeDaySegments={showOverlay ? activeDaySegments : []}

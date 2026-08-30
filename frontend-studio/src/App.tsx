@@ -7,17 +7,22 @@ import { Header } from './components/Header';
 import { GoogleSignInButton } from './components/GoogleSignInButton';
 import { MyTripsModal } from './components/MyTripsModal';
 import {
-  getCompareRoutes, postRouteThrough, postDetailRoute, postEnrichRoute, getWhoAmI,
+  getCompareRoutes, postRouteThrough, postDetailRoute, postDaySplit, postEnrichRoute, getWhoAmI,
   saveTrip, getCurrentTrip, getMyTrips, getTrip, deleteTrip, loginWithGoogle, getMe, logout,
-  getCredits, postFinalizePreview, postFinalizeTrip, getFinalizeStatus, getFinalizedTrip,
+  getCredits, postFinalizePreview, postRelodgePreview, postFinalizeTrip, getFinalizeStatus, getFinalizedTrip,
   decodeShape, decodeGoogleShape, geocode, reverseGeocode,
-  ApiStop, RouteOption, DetailRouteResult, EnrichRouteResult, TripProject, TripSummary,
+  ApiStop, RouteOption, DetailRouteResult, DayResult, RouteThroughSummary, EnrichRouteResult, TripProject, TripSummary,
   CreditsResult, FinalizedTripResult, FinalizePreviewResult, SelectedLodging,
 } from './api';
 import { mapDetourToMaxDetourS, mapDriveToDailyLimitS, mapInterestsToCategories, mapPaceToApiPace } from './quizMapping';
 import { dayColor } from './dayColors';
 import { splitPathIntoLegs, pivotDayIndex } from './routeSegments';
-import { PlanPanel, RouteThroughSummary } from './components/PlanPanel';
+import { attributeCandidateToDay } from './dayAttribution';
+import { DayRibbon } from './components/DayRibbon';
+import { VariantTabs } from './components/VariantTabs';
+import { DayPanel } from './components/DayPanel';
+import { CandidatesPanel } from './components/CandidatesPanel';
+import { formatDaysRu } from './format';
 import { DateModal } from './components/DateModal';
 import { FinalizeGateModal } from './components/FinalizeGateModal';
 import { FinalizeProgress } from './components/FinalizeProgress';
@@ -108,6 +113,24 @@ export default function App() {
   // show a non-blocking "recomputing" indicator only on the tab it actually applies to.
   const [loadingOptionIndex, setLoadingOptionIndex] = useState<number | null>(null);
   const routeThroughAbortRef = useRef<AbortController | null>(null);
+  // Шаг 2 переработки UI редактора: draft-phase day-split per option, via
+  // POST /day-split (Шаг 0 — pure arithmetic, reuses day_split.
+  // split_into_days as-is server-side, no Valhalla/Google/credit). Chained
+  // onto recomputeRouteThrough's own resolution below (needs its legs as
+  // input) rather than a separate trigger — this inherits the SAME "only
+  // the latest settled toggle actually completes" protection route-
+  // through's own AbortController already provides, no second timer-based
+  // debounce needed. Absent for an option until its FIRST live /route-
+  // through response arrives (the initial /compare-routes seed has no
+  // legs) — DayRibbon renders nothing until then, per its own spec.
+  const [dayRibbonByOption, setDayRibbonByOption] = useState<Map<number, DayResult[]>>(new Map());
+  const daySplitAbortRef = useRef<AbortController | null>(null);
+  // Draft-only "which day is highlighted in the ribbon" — independent of
+  // isolatedDay (finalized-map-only). Doesn't drive anything else yet
+  // (Шаг 3 wires the day panel/candidates to it); reset whenever the
+  // active option changes, since a day number from one option's split
+  // isn't meaningful for another's.
+  const [activeDayInDraft, setActiveDayInDraft] = useState<number | null>(null);
   // Debounce timer for the server autosave effect further down.
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Per-option Google Directions detail — exact numbers, distinct from the Valhalla-
@@ -198,6 +221,27 @@ export default function App() {
   // draft_state/buildDraftPayload: it's spent the moment finalize succeeds
   // or fails, never something to restore into a later session.
   const [selectedLodging, setSelectedLodging] = useState<SelectedLodging[] | null>(null);
+  // Custom lodging point ("Указать своё место" -> "Выбрать на карте"): which
+  // day's point is being picked via map click right now (null = not
+  // picking). Kept independent of pickingField (quiz-only, see below) since
+  // this happens well after the quiz, in phase 'plan'.
+  const [pickingLodgingDay, setPickingLodgingDay] = useState<number | null>(null);
+  // One-shot relay for a resolved map pick, handed to LodgingSelectionModal
+  // and cleared once it consumes it — same relay-state pattern as origin/dest
+  // dragging, just round-tripped through the modal instead of applied here.
+  const [pickedLodgingPoint, setPickedLodgingPoint] = useState<{ day: number; lat: number; lon: number; name: string } | null>(null);
+  // True while the in-flight finalize attempt is a RE-LODGE of an already-
+  // finalized trip (FinalizedView's "Добавить/Изменить ночёвки"), as opposed
+  // to a fresh finalize from 'plan'. Branches handleConfirmFinalize (skip
+  // saveDraftNow — draft_state is untouched and this session's in-memory
+  // plan state was never populated for a trip opened straight into
+  // 'finalized', see handleOpenFinalizedFromList) and the polling
+  // success/failure handlers (stay on/return to 'finalized', not 'plan').
+  const [isRelodging, setIsRelodging] = useState<boolean>(false);
+  const [relodgeLoading, setRelodgeLoading] = useState<boolean>(false);
+  // Surfaced in FinalizedView itself (not the chat panel, hidden in phase
+  // 'finalized') — cleared at the start of the next attempt.
+  const [relodgeError, setRelodgeError] = useState<string | null>(null);
 
   // Сворачиваемые дни в FinalizedView: expandedDays/activeDay live INSIDE
   // FinalizedView (its own local state, not lifted here, not in snapshot/
@@ -301,6 +345,20 @@ export default function App() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [pickingField]);
+
+  // Esc cancels lodging map-picking mode too — reopens the modal untouched,
+  // same as clicking away does for origin/dest above.
+  useEffect(() => {
+    if (pickingLodgingDay === null) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setPickingLodgingDay(null);
+        setShowLodgingModal(true);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [pickingLodgingDay]);
 
   // Auto-generate title from origin and dest if not manually edited
   useEffect(() => {
@@ -479,10 +537,40 @@ export default function App() {
   // then exits picking mode. Reuses handleMarkerDragEnd — clicking is just another way of
   // dropping a pin, so it gets the same Colorado check / reverse-geocode / rebuild behavior.
   const handleMapClick = (lat: number, lng: number) => {
+    if (pickingLodgingDay !== null) {
+      const day = pickingLodgingDay;
+      setPickingLodgingDay(null);
+      handleLodgingMapPick(day, lat, lng);
+      return;
+    }
     if (!pickingField) return;
     const field = pickingField;
     setPickingField(null);
     handleMarkerDragEnd(field, lat, lng);
+  };
+
+  // "Выбрать на карте" inside LodgingSelectionModal: hide the modal (it stays
+  // mounted, see index.css's .modal/.modal.on — its own selectedByDay state
+  // survives this) so the map underneath becomes clickable.
+  const handlePickLodgingOnMap = (day: number) => {
+    setPickingLodgingDay(day);
+    setShowLodgingModal(false);
+  };
+
+  // Resolves a lodging map click into a named point and hands it back to the
+  // (now visible again) modal via the pickedLodgingPoint relay. Reverse-geocode
+  // failing is not a blocker per spec — falls back to a generic label, the
+  // coordinates themselves are still perfectly usable.
+  const handleLodgingMapPick = async (day: number, lat: number, lng: number) => {
+    setShowLodgingModal(true);
+    let name = 'Своя точка';
+    try {
+      const result = await reverseGeocode(lat, lng);
+      name = result.name;
+    } catch {
+      // fall back to the generic label above
+    }
+    setPickedLodgingPoint({ day, lat, lon: lng, name });
   };
 
   const handleNextQuiz = async () => {
@@ -543,7 +631,13 @@ export default function App() {
     const restoredIncluded = new Map<number, Set<number>>(
       (draft.includedByOption ?? []).map(([idx, ids]) => [idx, new Set(ids)])
     );
-    const restoredThrough = new Map<number, RouteThroughSummary>(draft.routeThroughByOption ?? []);
+    // legs is a new field (Шаг 0 of the trip-editor UI migration) — a draft
+    // saved before it existed has entries without it; default to [] (same
+    // "not yet known" meaning enterPlan's own seed uses) rather than
+    // leaving it undefined for whatever later reads it.
+    const restoredThrough = new Map<number, RouteThroughSummary>(
+      (draft.routeThroughByOption ?? []).map(([idx, summary]) => [idx, { legs: [], ...summary }])
+    );
 
     setOptions(restoredOptions);
     setActiveOptionIndex(restoredActiveIndex);
@@ -555,6 +649,12 @@ export default function App() {
     setEnrichLoadingOptionIndex(null);
     setLoadingOptionIndex(null);
     routeThroughAbortRef.current?.abort();
+    // Keyed by option index the same as routeThroughByOption — stale
+    // entries from whatever trip was open before this one would otherwise
+    // show the WRONG day-split the instant a matching index coincides.
+    setDayRibbonByOption(new Map());
+    daySplitAbortRef.current?.abort();
+    setActiveDayInDraft(null);
     setSelectedStopId(null);
     setRouteOrigin(draft.routeOrigin ?? null);
     setRouteDest(draft.routeDest ?? null);
@@ -590,6 +690,9 @@ export default function App() {
     setIncludedByOption(new Map());
     setRouteThroughByOption(new Map());
     setLoadingOptionIndex(null);
+    setDayRibbonByOption(new Map());
+    daySplitAbortRef.current?.abort();
+    setActiveDayInDraft(null);
     setDetailedByOption(new Map());
     setDetailLoadingOptionIndex(null);
     setEnrichedByOption(new Map());
@@ -709,6 +812,39 @@ export default function App() {
       });
   };
 
+  // FinalizedView's "Добавить/Изменить ночёвки" — re-lodge an already-
+  // finalized trip. Fetches lodging options against the CURRENT version's
+  // exact (Google-computed) day boundaries (finalize.py's
+  // build_relodge_preview — never re-runs day_split), then reuses the SAME
+  // picker/payment pipeline a fresh finalize uses (openFinalizeGate ->
+  // handleConfirmFinalize -> postFinalizeTrip): a re-lodge is a full paid
+  // finalize, just entered from FinalizedView instead of 'plan'. No
+  // saveDraftNow here or in handleConfirmFinalize (see isRelodging) —
+  // draft_state is untouched, this is not a draft edit.
+  const handleRelodgeClick = () => {
+    if (!tripProjectId) return;
+    setRelodgeError(null);
+    setIsRelodging(true);
+    setRelodgeLoading(true);
+    postRelodgePreview(tripProjectId)
+      .then(preview => {
+        setRelodgeLoading(false);
+        setFinalizePreview(preview);
+        if (preview.needs_selection) {
+          setShowLodgingModal(true);
+        } else {
+          setSelectedLodging(null);
+          openFinalizeGate();
+        }
+      })
+      .catch(err => {
+        console.error('Failed to fetch relodge preview:', err);
+        setRelodgeLoading(false);
+        setIsRelodging(false);
+        setRelodgeError((err as Error).message || 'Не удалось подготовить варианты ночёвок. Попробуйте ещё раз.');
+      });
+  };
+
   const handleLodgingContinue = (chosen: SelectedLodging[]) => {
     setSelectedLodging(chosen);
     setShowLodgingModal(false);
@@ -727,6 +863,7 @@ export default function App() {
   const handleLodgingCancel = () => {
     setShowLodgingModal(false);
     setFinalizePreview(null);
+    setIsRelodging(false);
   };
 
   const handleLoginClick = () => {
@@ -853,10 +990,18 @@ export default function App() {
       ? finalizePreview.days.map(d => ({ day: d.day, options: d.lodging_options }))
       : null;
 
-    saveDraftNow()
-      // saveDraftNow never rejects (see its own comment) — even a failed save
-      // still leaves the last successfully-saved draft_state for Finalize to
-      // read, so proceeding here regardless is intentional, not a swallowed bug.
+    // A re-lodge attempt never saves the draft: draft_state is already
+    // correct and untouched server-side, and this session's in-memory plan
+    // state (options/activeOptionIndex/etc) was never populated for a trip
+    // opened straight into 'finalized' (see handleOpenFinalizedFromList) —
+    // saving here would silently overwrite the real draft_state with an
+    // empty one. A fresh finalize from 'plan' still needs the save, same as
+    // before (saveDraftNow never rejects — see its own comment — so
+    // proceeding regardless of its outcome is intentional, not a swallowed
+    // bug).
+    const beforeFinalize = isRelodging ? Promise.resolve() : saveDraftNow();
+
+    beforeFinalize
       .then(() => postFinalizeTrip(tripId, idKey, selectedLodging, lodgingOptionsByDay))
       .then(result => {
         setFinalizeSubmitting(false);
@@ -915,6 +1060,7 @@ export default function App() {
         // starts from a fresh preview, not a stale selection.
         setFinalizePreview(null);
         setSelectedLodging(null);
+        setIsRelodging(false);
         setPhase('finalized');
         if (result.is_first_finalize) {
           setShowWelcomeModal(true);
@@ -925,21 +1071,41 @@ export default function App() {
       })
       .catch(err => {
         console.error('Failed to load finalized trip:', err);
-        setFinalizeGateError('Поездка финализирована, но результат не загрузился. Загляните в «Мои поездки».');
-        setPhase('plan');
+        // The finalize itself succeeded (polling already saw 'done') — only
+        // this follow-up read failed. A re-lodge stays on 'finalized' with
+        // whatever's still shown (the OLD version — reopening via "Мои
+        // поездки" picks up the new one); a fresh finalize has nothing to
+        // fall back to but 'plan'.
+        if (isRelodging) {
+          setIsRelodging(false);
+          setRelodgeError('Ночёвки обновлены, но результат не загрузился. Загляните в «Мои поездки».');
+        } else {
+          setFinalizeGateError('Поездка финализирована, но результат не загрузился. Загляните в «Мои поездки».');
+          setPhase('plan');
+        }
       });
   };
 
   // Step 6 (failure): the backend has already refunded by the time 'failed'
   // is observable here (process_finalization's refund happens before the job
-  // row is updated) — this just reflects that back, softly, and returns to
-  // the draft, which was never touched.
+  // row is updated) — this just reflects that back, softly. A fresh finalize
+  // returns to the draft, which was never touched; a re-lodge returns to
+  // 'finalized' with the CURRENT (also untouched — only the new attempt
+  // failed) version, never 'plan' (whose in-memory plan state was never
+  // populated for a trip opened straight into 'finalized').
   const handleFinalizeJobFailed = (error: string | null) => {
     setFinalizeJobId(null);
     setFinalizePreview(null);
     setSelectedLodging(null);
-    setPhase('plan');
     getCredits().then(setCredits).catch(() => {});
+    if (isRelodging) {
+      setIsRelodging(false);
+      setPhase('finalized');
+      setRelodgeError('Не удалось обновить ночёвки — кредит возвращён. Можно попробовать ещё раз.');
+      console.error('Relodge finalize job failed:', error);
+      return;
+    }
+    setPhase('plan');
     setMessages(prev => [...prev, {
       id: `finalize-failed-${Date.now()}`,
       sender: 'bot',
@@ -990,6 +1156,11 @@ export default function App() {
           total_s: option.total_s,
           delta_s: option.delta_s,
           through_shape: option.through_shape,
+          // compare_routes (what seeds this) never returns per-leg data,
+          // only aggregates — legs only exist once a live /route-through
+          // call actually runs (see recomputeRouteThrough below). Empty,
+          // not fabricated, until then.
+          legs: [],
         });
       }
     });
@@ -999,6 +1170,11 @@ export default function App() {
     setIncludedByOption(initialIncluded);
     setRouteThroughByOption(initialThrough);
     setSelectedStopId(null);
+    // A fresh route generation invalidates any previous day-split entirely
+    // (different stops, different legs) — same reasoning as clearing
+    // routeThroughByOption's own stale per-option data above.
+    setDayRibbonByOption(new Map());
+    setActiveDayInDraft(null);
     setPhase('plan');
 
     const primaryIncluded = initialIncluded.get(0)?.size ?? 0;
@@ -1034,6 +1210,9 @@ export default function App() {
     setIncludedByOption(new Map());
     setRouteThroughByOption(new Map());
     setLoadingOptionIndex(null);
+    setDayRibbonByOption(new Map());
+    daySplitAbortRef.current?.abort();
+    setActiveDayInDraft(null);
     setDetailedByOption(new Map());
     setDetailLoadingOptionIndex(null);
     setEnrichedByOption(new Map());
@@ -1209,15 +1388,52 @@ export default function App() {
             total_s: result.total_s,
             delta_s: result.delta_s,
             through_shape: result.route_shape,
+            legs: result.legs,
           });
           return next;
         });
         setLoadingOptionIndex(current => (current === optionIndex ? null : current));
+        recomputeDaySplit(optionIndex, result.legs, orderedStops.length);
       })
       .catch(err => {
         if (err?.name === 'AbortError') return; // superseded by a newer toggle
         console.error('Failed to recompute route through stops:', err);
         setLoadingOptionIndex(current => (current === optionIndex ? null : current));
+      });
+  };
+
+  // Шаг 2: draft-phase day-split for `optionIndex`, from route-through's
+  // OWN legs (chained by the caller above — never a separate trigger, see
+  // dayRibbonByOption's own state comment for why that's enough). `legs`
+  // empty means route-through hasn't actually resolved for this option yet
+  // (the /compare-routes seed has none) — nothing to split, skip the call
+  // entirely rather than let the backend 400 on a length mismatch.
+  const recomputeDaySplit = (optionIndex: number, legs: { duration_s: number }[], stopCount: number) => {
+    if (legs.length === 0) return;
+
+    daySplitAbortRef.current?.abort();
+    const controller = new AbortController();
+    daySplitAbortRef.current = controller;
+
+    postDaySplit(
+      {
+        legs: legs.map(l => ({ duration_s: l.duration_s })),
+        stop_count: stopCount,
+        daily_limit_s: mapDriveToDailyLimitS(answers.drive as string | undefined),
+        pace: mapPaceToApiPace(answers.pace as string | undefined),
+      },
+      controller.signal
+    )
+      .then(result => {
+        setDayRibbonByOption(prev => {
+          const next = new Map(prev);
+          next.set(optionIndex, result.days);
+          return next;
+        });
+      })
+      .catch(err => {
+        if (err?.name === 'AbortError') return; // superseded by a newer recompute
+        console.error('Failed to recompute day split:', err);
       });
   };
 
@@ -1409,7 +1625,12 @@ export default function App() {
     selected: boolean;
   }> = [];
 
-  if (phase === 'finalized' && finalizedTrip) {
+  // 'finalizing' + a still-populated finalizedTrip only happens mid-relodge
+  // (App.tsx never clears finalizedTrip until the NEW result loads) — keep
+  // showing the current (untouched) version's map instead of going blank
+  // for the ~15-20s wait, same data a normal finalize never has yet at this
+  // phase (finalizedTrip is null then, so this condition is unaffected).
+  if ((phase === 'finalized' || phase === 'finalizing') && finalizedTrip) {
     const finOrigin = { lat: finalizedTrip.origin.lat, lng: finalizedTrip.origin.lon };
     const finDest = { lat: finalizedTrip.destination.lat, lng: finalizedTrip.destination.lon };
     const path = decodeGoogleShape(finalizedTrip.route.shape);
@@ -1533,24 +1754,29 @@ export default function App() {
     // different, smaller set of days (just the isolated one plus whichever
     // precedes it) — never duplicate the per-option field mapping.
     const buildLodgingMarkers = (days: typeof finalizedTrip.days) => days.flatMap(day => {
-      if (day.lodging_options.length > 0) {
-        return day.lodging_options.map(opt => ({
-          position: { lat: opt.lat, lng: opt.lon },
-          name: opt.name,
-          placeId: opt.place_id,
-          rating: opt.rating,
-          userRatingsTotal: opt.user_ratings_total,
-          priceLevel: opt.price_level,
-          vicinity: opt.vicinity,
-          mapsUrl: opt.maps_url,
-          selected: opt.selected,
-        }));
-      }
-      if (day.lodging) {
-        return [{
+      const optionMarkers = day.lodging_options.map(opt => ({
+        position: { lat: opt.lat, lng: opt.lon },
+        name: opt.name,
+        placeId: opt.place_id,
+        rating: opt.rating,
+        userRatingsTotal: opt.user_ratings_total,
+        priceLevel: opt.price_level,
+        vicinity: opt.vicinity,
+        mapsUrl: opt.maps_url,
+        selected: opt.selected,
+      }));
+
+      // A custom (non-Places) pick never appears in lodging_options (it
+      // wasn't a preview candidate), so it needs its own marker here even
+      // when optionMarkers is non-empty — otherwise the night's actual
+      // choice would be missing from the map entirely, leaving only the
+      // (all-unselected) candidates it was picked over. Old snapshots
+      // without lodging_options (optionMarkers empty) fall back the same way.
+      if (day.lodging && (day.lodging.custom || optionMarkers.length === 0)) {
+        return [...optionMarkers, {
           position: { lat: day.lodging.lat, lng: day.lodging.lon },
           name: day.lodging.name,
-          placeId: day.lodging.place_id,
+          placeId: day.lodging.place_id ?? `custom-${day.day}`,
           rating: day.lodging.rating,
           userRatingsTotal: null,
           priceLevel: null,
@@ -1559,7 +1785,7 @@ export default function App() {
           selected: true,
         }];
       }
-      return [];
+      return optionMarkers;
     });
     lodgingMarkersForMap = buildLodgingMarkers(finalizedTrip.days);
 
@@ -1742,6 +1968,70 @@ export default function App() {
     };
   }, [phase, options, activeOptionIndex, includedByOption, routeThroughByOption, tripTitle]);
 
+  // Шаг 1 переработки UI редактора: map-on-top layout for the draft editor
+  // and the finalized view — everything else (quiz/refine/generating, AND
+  // 'finalizing', which still shows FinalizeProgress in the left .panel
+  // exactly as today) keeps the original side-by-side layout untouched.
+  // 'finalizing' deliberately excluded: today it renders nothing in the
+  // right-hand panel slot at all (neither PlanPanel nor FinalizedView), so
+  // there's nothing here to move into the new content grid, and moving ITS
+  // layout too would either hide FinalizeProgress (it lives in .panel) or
+  // require relocating a component this step doesn't otherwise touch.
+  const isEditorPhase = phase === 'plan' || phase === 'finalized';
+
+  // Шаг 3: draft-phase active-day/candidates data for DayPanel/
+  // CandidatesPanel — independent of the map-derivation block above (not
+  // touched, per this step's own boundaries), even though the underlying
+  // filter+sort is the same; that block's own includedSortedForMap is
+  // block-scoped inside its own if/else and isn't reachable from here.
+  const activeOptionForPanels = options[activeOptionIndex];
+  const includedIdsForPanels = includedByOption.get(activeOptionIndex) ?? new Set<number>();
+  const includedStopsForPanels = (activeOptionForPanels?.stops ?? [])
+    .filter(s => includedIdsForPanels.has(s.id))
+    .sort((a, b) => a.to_poi_s - b.to_poi_s);
+  const otherStopsForPanels = (activeOptionForPanels?.stops ?? [])
+    .filter(s => !includedIdsForPanels.has(s.id))
+    .sort((a, b) => a.to_poi_s - b.to_poi_s);
+
+  const draftDaysForActiveOption = dayRibbonByOption.get(activeOptionIndex) ?? [];
+  // Falls back to day 1 whenever activeDayInDraft doesn't (or no longer
+  // does) name a real day in the CURRENT split — either nothing's been
+  // explicitly clicked yet, or a toggle just emptied out whichever day WAS
+  // selected (e.g. removing a day's only stop can shrink the split from
+  // under it). Without the "still exists" check, that second case would
+  // fall through to activeDraftDay=null below and show DayPanel's "no
+  // split yet" placeholder even though a split genuinely exists — just not
+  // one with that day number anymore. Kept in sync with what DayRibbon
+  // highlights (both read this SAME derived value) so the ribbon's active
+  // block and the panel's shown day never disagree.
+  const activeDayStillExists = activeDayInDraft != null
+    && draftDaysForActiveOption.some(d => d.day === activeDayInDraft);
+  const effectiveActiveDay = activeDayStillExists ? activeDayInDraft : (draftDaysForActiveOption[0]?.day ?? null);
+  const activeDraftDay = effectiveActiveDay != null
+    ? draftDaysForActiveOption.find(d => d.day === effectiveActiveDay) ?? null
+    : null;
+  const activeDraftDayStops = activeDraftDay
+    ? activeDraftDay.stop_indices.map(idx => includedStopsForPanels[idx]).filter((s): s is ApiStop => s != null)
+    : [];
+  const isLastDraftDay = activeDraftDay != null
+    && draftDaysForActiveOption.length > 0
+    && activeDraftDay.day === draftDaysForActiveOption[draftDaysForActiveOption.length - 1].day;
+
+  const candidatesWithDay = otherStopsForPanels.map(stop => ({
+    stop,
+    day: attributeCandidateToDay(stop, draftDaysForActiveOption, includedStopsForPanels),
+  }));
+
+  // Footer's day_plan indicator: actual day count comes from the SAME live
+  // draft day-split the ribbon/panel use (dayRibbonByOption), never the
+  // dead detailedByOption path PlanPanel's day-grouping used to read (see
+  // this step's own instruction not to revive it). Same over_plan
+  // semantics finalize.py/FinalizedView already use elsewhere: over_plan
+  // only when actual > requested AND the trip isn't flexible.
+  const plannedDaysAnswer = typeof answers.days === 'number' ? answers.days : null;
+  const actualDraftDayCount = draftDaysForActiveOption.length;
+  const isDraftOverPlan = plannedDaysAnswer != null && actualDraftDayCount > plannedDaysAnswer && !answers.flexible_days;
+
   return (
     <div className="flex flex-col h-screen w-screen overflow-hidden bg-[#22262b]">
       <Header
@@ -1759,8 +2049,10 @@ export default function App() {
         onMyTripsClick={handleMyTripsClick}
       />
 
-      <div className="app flex-1 min-h-0">
-        {/* LEFT PANEL: Console Control Panel */}
+      <div className={`app flex-1 min-h-0 ${isEditorPhase ? 'app--stacked' : ''}`}>
+        {/* LEFT PANEL: Console Control Panel — hidden (not unmounted, see
+            .app--stacked .panel in index.css) for the editor phases; its
+            own content/classes are otherwise completely untouched. */}
         <div className="panel w-full md:w-[420px] md:min-w-[420px] h-[58vh] md:h-full bg-asphalt flex flex-col min-w-0 border-r border-[#000000]">
 
           <>
@@ -2044,9 +2336,25 @@ export default function App() {
 
         </div>
 
-        {/* RIGHT VIEWPORT: Google Map component + plan panel */}
-        <main className="flex-1 h-[42vh] md:h-full flex overflow-hidden" id="right-viewport">
-          <div className="relative flex-1 h-full overflow-hidden">
+        {/* RIGHT VIEWPORT: Google Map component + plan panel.
+            MapComponent stays at this exact JSX position regardless of
+            isEditorPhase — only the wrapping elements' classNames/style
+            change (row+full-height vs column+fixed-height map). This is
+            deliberate: conditionally rendering two DIFFERENT subtrees here
+            would unmount/remount the underlying google.maps.Map instance on
+            every 'plan'<->'finalized' transition, losing TripMap's own zoom
+            state and MapController's isolation-camera tracking (wasIsolatedRef)
+            — see the layout-migration plan's own risk notes on this exact
+            hazard. Only the surrounding container changes; React never sees
+            a different element at this position, so no remount happens. */}
+        <main
+          className={isEditorPhase ? 'flex-1 min-h-0 flex flex-col overflow-hidden' : 'flex-1 h-[42vh] md:h-full flex overflow-hidden'}
+          id="right-viewport"
+        >
+          <div
+            className={isEditorPhase ? 'relative w-full flex-shrink-0 overflow-hidden' : 'relative flex-1 h-full overflow-hidden'}
+            style={isEditorPhase ? { height: '34vh' } : undefined}
+          >
             <MapComponent
               phase={phase}
               generationStep={generationStep}
@@ -2057,6 +2365,7 @@ export default function App() {
               onDestDragEnd={(lat, lng) => handleMarkerDragEnd('dest', lat, lng)}
               pickingField={pickingField}
               onMapClick={handleMapClick}
+              pickingLodging={pickingLodgingDay !== null}
               planRouteLines={planRouteLinesForMap}
               planMarkers={planMarkersForMap}
               activeDaySegments={activeDaySegments}
@@ -2074,36 +2383,102 @@ export default function App() {
             />
           </div>
 
+          {/* Шаг 3: variant tabs moved here from inside PlanPanel (same
+              onSelectTab logic, just relocated above the ribbon per the
+              reference prototype). Not shown in 'finalized' — a finalized
+              trip has exactly one locked-in route, no variants to switch. */}
           {phase === 'plan' && (
-            <PlanPanel
+            <VariantTabs
               options={options}
               activeOptionIndex={activeOptionIndex}
-              onSelectTab={setActiveOptionIndex}
+              onSelectTab={(idx) => { setActiveOptionIndex(idx); setActiveDayInDraft(null); }}
               includedByOption={includedByOption}
-              onToggleStop={handleToggleStop}
               routeThroughByOption={routeThroughByOption}
               isRecomputing={loadingOptionIndex === activeOptionIndex}
-              selectedStopId={selectedStopId}
-              onSelectStop={handleSelectStop}
-              detailedByOption={detailedByOption}
-              enrichedByOption={enrichedByOption}
-              onFinalizeClick={handleFinalizeClick}
-              finalizePreviewLoading={finalizePreviewLoading}
             />
           )}
 
-          {phase === 'finalized' && finalizedTrip && (
-            <FinalizedView
-              ref={finalizedViewRef}
-              trip={finalizedTrip}
-              selectedStopId={selectedStopId}
-              onSelectStop={handleSelectStop}
-              onEditDraft={handleEditDraftFromFinalized}
-              onDayHover={setHoveredMapDay}
-              onIsolateDayChange={setIsolatedDay}
+          {/* Шаг 2: draft-only day ribbon — see dayRibbonByOption's own
+              state comment for why it's empty until the first live
+              /route-through response. Not shown in 'finalized' this step
+              (out of scope, see the migration plan). */}
+          {phase === 'plan' && (
+            <DayRibbon
+              days={draftDaysForActiveOption}
+              activeDay={effectiveActiveDay}
+              onSelectDay={setActiveDayInDraft}
+              originLabel={typeof answers.origin === 'string' ? answers.origin : Array.isArray(answers.origin) ? answers.origin[0] : null}
+              destLabel={typeof answers.dest === 'string' ? answers.dest : Array.isArray(answers.dest) ? answers.dest[0] : null}
             />
           )}
+
+          {/* Шаг 3: DayPanel/CandidatesPanel replace PlanPanel in the draft;
+              FinalizedView (Шаг 1, untouched) still occupies the wide
+              column alone for 'finalized' — the narrow column stays empty
+              there until Шаг 4. */}
+          {isEditorPhase && (
+            <div className="editor-content flex-1 min-h-0 gap-3 p-3">
+              {phase === 'plan' && (
+                <>
+                  <DayPanel
+                    day={activeDraftDay}
+                    dayStops={activeDraftDayStops}
+                    isLastDay={isLastDraftDay}
+                    selectedStopId={selectedStopId}
+                    onSelectStop={handleSelectStop}
+                    onToggleStop={handleToggleStop}
+                  />
+                  <CandidatesPanel
+                    candidates={candidatesWithDay}
+                    activeDay={effectiveActiveDay}
+                    onAddStop={handleToggleStop}
+                  />
+                </>
+              )}
+
+              {phase === 'finalized' && finalizedTrip && (
+                <FinalizedView
+                  ref={finalizedViewRef}
+                  trip={finalizedTrip}
+                  selectedStopId={selectedStopId}
+                  onSelectStop={handleSelectStop}
+                  onEditDraft={handleEditDraftFromFinalized}
+                  onDayHover={setHoveredMapDay}
+                  onIsolateDayChange={setIsolatedDay}
+                  onRelodge={handleRelodgeClick}
+                  relodgeLoading={relodgeLoading}
+                  relodgeError={relodgeError}
+                />
+              )}
+            </div>
+          )}
         </main>
+
+        {/* Шаг 3: editor footer — day_plan indicator (actual day count from
+            the SAME live dayRibbonByOption the ribbon/panel use, never the
+            dead detailedByOption path PlanPanel's day-grouping used to
+            read) + the finalize button, moved from inside PlanPanel. Same
+            onFinalizeClick/paywall gate logic, unchanged, just relocated. */}
+        {phase === 'plan' && (
+          <div className="flex-shrink-0 flex items-center gap-4 px-4 py-2.5 border-t border-black bg-[#14171a] flex-wrap">
+            {actualDraftDayCount > 0 && (
+              <span className={`text-[12px] ${isDraftOverPlan ? 'text-[#c05640]' : 'text-[#8b9199]'}`}>
+                Поездка займёт {formatDaysRu(actualDraftDayCount)}
+                {plannedDaysAnswer != null && plannedDaysAnswer !== actualDraftDayCount
+                  ? ` — планировали ${formatDaysRu(plannedDaysAnswer)}`
+                  : ''}
+              </span>
+            )}
+            <div className="flex-1" />
+            <button
+              onClick={handleFinalizeClick}
+              disabled={finalizePreviewLoading}
+              className="px-4 py-2.5 rounded text-[13px] font-semibold bg-[#e8b53f] text-[#14171a] hover:bg-[#d4a230] transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-default"
+            >
+              {finalizePreviewLoading ? 'Готовим варианты…' : 'Финализировать · 1 кредит'}
+            </button>
+          </div>
+        )}
 
         {/* Confirm New Trip Modal */}
         <div className={`modal ${showConfirmNewTrip ? 'on' : ''}`} id="confirm-new-trip">
@@ -2181,6 +2556,24 @@ export default function App() {
           onContinue={handleLodgingContinue}
           onSkip={handleLodgingSkip}
           onCancel={handleLodgingCancel}
+          onPickOnMap={handlePickLodgingOnMap}
+          mapPickResult={pickedLodgingPoint}
+          onMapPickResultConsumed={() => setPickedLodgingPoint(null)}
+          // Only for a re-lodge (isRelodging) — finalizedTrip can otherwise
+          // hold an UNRELATED previous finalize's result (or be null), which
+          // must never leak into a fresh finalize's default selections.
+          existingLodging={isRelodging && finalizedTrip
+            ? finalizedTrip.days
+              .filter((d) => d.lodging != null)
+              .map((d) => ({
+                day: d.day,
+                place_id: d.lodging!.place_id,
+                lat: d.lodging!.lat,
+                lon: d.lodging!.lon,
+                name: d.lodging!.name,
+                custom: d.lodging!.custom,
+              }))
+            : undefined}
         />
 
         {/* Steps 2-3 of Finalize: paywall (balance=0) or the summary+confirm

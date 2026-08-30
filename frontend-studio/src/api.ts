@@ -186,6 +186,19 @@ export interface RouteThroughResult {
   delta_s: number;
 }
 
+// Per-option cache of a /route-through response, kept across the draft's
+// lifetime in App.tsx (routeThroughByOption) — was defined in PlanPanel.tsx
+// originally; moved here in Шаг 3 of the trip-editor UI migration once
+// PlanPanel was deleted and VariantTabs also needed it.
+export interface RouteThroughSummary {
+  total_s: number;
+  delta_s: number;
+  through_shape: string;
+  // Per-hop drive time from /route-through's own response — kept (Шаг 0)
+  // so a day-split can be requested (POST /day-split) without re-fetching.
+  legs: RouteLeg[];
+}
+
 export async function postRouteThrough(
   req: RouteThroughRequest,
   signal?: AbortSignal
@@ -341,6 +354,53 @@ export async function postDetailRoute(req: DetailRouteRequest): Promise<DetailRo
   if (!res.ok) {
     const body = await res.json().catch(() => null);
     throw new Error(body?.detail || `Detail route request failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
+// Шаг 0/2 переработки UI редактора: pure-arithmetic day-split for the
+// DRAFT, backed by POST /day-split (reuses day_split.split_into_days as-is
+// server-side — no Google/Valhalla/DB/credit involved, see main.py). Only
+// duration_s per leg, matching what the backend actually reads — never the
+// full RouteLeg shape (from_index/to_index/distance_km), which it ignores.
+export interface DaySplitLegReq {
+  duration_s: number;
+}
+
+export interface DaySplitRequest {
+  // Length must be stop_count + 1, same requirement day_split.split_into_days
+  // itself enforces (a 400 otherwise, see main.py's DaySplitRequest).
+  legs: DaySplitLegReq[];
+  stop_count: number;
+  // Mapped client-side from the quiz's "drive" answer (quizMapping.ts::
+  // mapDriveToDailyLimitS), same convention as DetailRouteRequest above.
+  daily_limit_s: number;
+  // Mapped client-side (quizMapping.ts::mapPaceToApiPace), same source
+  // /compare-routes and /stops already use — resolved server-side into
+  // awake_limit_s via services.stops.awake_limit_s_for_pace, the SAME
+  // function finalize.build_finalize_preview uses. Omit to fall back to the
+  // backend's own "balanced" default.
+  pace?: 'relaxed' | 'balanced' | 'packed';
+  visit_s?: number;
+}
+
+export interface DaySplitResult {
+  days: DayResult[];
+}
+
+export async function postDaySplit(req: DaySplitRequest, signal?: AbortSignal): Promise<DaySplitResult> {
+  const res = await fetch(`${API_URL}/day-split`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(req),
+    signal,
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Day split request failed: ${res.status}`);
   }
 
   return res.json();
@@ -692,9 +752,32 @@ export async function postFinalizePreview(tripId: string): Promise<FinalizePrevi
   return res.json();
 }
 
+// Re-lodge (FinalizedView's "Добавить/Изменить ночёвки"): same response
+// shape as postFinalizePreview above — the picker/payment flow that follows
+// is identical either way — but the backend reuses the CURRENT finalized
+// snapshot's exact (Google-computed) day boundaries instead of re-running
+// Valhalla/day_split (see finalize.build_relodge_preview). Also free; only
+// the /finalize call that follows charges a credit. 404s the same
+// indistinguishable way as GET .../finalized if the trip was never
+// finalized (or isn't this session's/user's).
+export async function postRelodgePreview(tripId: string): Promise<FinalizePreviewResult> {
+  const res = await fetch(`${API_URL}/trips/${tripId}/relodge-preview`, {
+    method: 'POST',
+    credentials: 'include',
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(body?.detail || `Relodge preview request failed: ${res.status}`);
+  }
+
+  return res.json();
+}
+
 export interface SelectedLodging {
   day: number;
-  place_id: string;
+  // null for a custom (non-Places) point — see `custom` below.
+  place_id: string | null;
   lat: number;
   lon: number;
   name: string;
@@ -703,6 +786,10 @@ export interface SelectedLodging {
   // without needing to re-fetch from Places.
   rating: number | null;
   vicinity: string | null;
+  // True when the user entered/picked their own point instead of choosing a
+  // Places candidate (LodgingSelectionModal's "Указать своё место"). Drives
+  // place_id being null and rating/vicinity/maps_url being absent downstream.
+  custom: boolean;
 }
 
 export interface FinalizeResult {
@@ -807,13 +894,16 @@ export interface FinalizedEnrichment {
 }
 
 export interface FinalizedLodging {
-  place_id: string;
+  place_id: string | null;
   name: string;
   lat: number;
   lon: number;
+  // Coordinate-based fallback when there's no place_id (custom point) — see
+  // finalize.py's _build_finalized_snapshot. Never absent.
   maps_url: string;
   rating: number | null;
   vicinity: string | null;
+  custom: boolean;
 }
 
 // Every candidate shown for this night in the free preview picker, selected

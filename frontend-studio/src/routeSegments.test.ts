@@ -75,6 +75,51 @@ check('nearestPointIndices: finds a waypoint offset ~300m from the road, not jus
   assert.equal(idx, 50);
 });
 
+// --- Bug 2 (routeSegments.ts): the closing leg of a round trip is often the
+// longest uninterrupted stretch of the whole route — a jump consuming well
+// over MONOTONIC_JUMP_WARN_FRACTION (0.3) of the path is expected and
+// CORRECT for the LAST waypoint, and must not be second-guessed into a
+// bounded fallback that can never reach it. Confirmed on real production
+// data (a 135321-point round-trip polyline): the primary search already
+// finds the true final point correctly on its own; only the "implausible
+// jump" validator was wrongly overriding that correct answer.
+//
+// Geometry here is built so segment B is an IMPROVEMENT over segment A
+// (never a hysteresis-triggering regression) and segment C is a single
+// smooth, monotonic approach all the way to an exact hit at the path's
+// last point — this isolates the validator's behavior, not the primary
+// search's (already covered by the "first approach" test above).
+check('nearestPointIndices: a legitimately large final jump (>30% of the path) matches the true end, not a fallback stub', () => {
+  const path: { lat: number; lng: number }[] = [];
+
+  // Segment A: waypoint 1's own region, far from waypoint 2's target (0) —
+  // so the search for waypoint 2 doesn't start out deceptively close to 0.
+  for (let i = 0; i <= 100; i++) path.push({ lat: 1000 + i * 0.01, lng: 0 }); // 1000.0 -> 1000.5
+
+  // Segment B: a long, flat "middle of the trip" stretch far from both
+  // targets. Arriving here from segment A is a big IMPROVEMENT in distance
+  // to waypoint 2's target, never a regression, so hysteresis never fires.
+  for (let i = 1; i <= 8900; i++) path.push({ lat: 500, lng: 0 });
+
+  // Segment C: the genuine final approach — smoothly, monotonically closing
+  // the distance to origin (target 0) over the last 100 points, exact hit
+  // at the path's very last point.
+  for (let i = 1; i <= 100; i++) path.push({ lat: 500 * (1 - i / 100), lng: 0 });
+
+  const waypoints = [
+    { lat: 1000.2, lng: 0 }, // waypoint 1, matches within segment A
+    { lat: 0, lng: 0 },      // closing waypoint -- true match is the path's LAST point
+  ];
+  const indices = nearestPointIndices(path, waypoints);
+
+  const jumpFraction = (indices[1] - indices[0]) / path.length;
+  assert.ok(jumpFraction > 0.3, `test setup check: expected a >30% jump, got ${(jumpFraction * 100).toFixed(1)}%`);
+  assert.equal(
+    indices[1], path.length - 1,
+    `expected the closing waypoint to match the path's true end, got ${indices[1]} (path.length=${path.length})`
+  );
+});
+
 // --- Bug 2: round-trip pivot hop attribution ---
 check('pivotDayIndex: mid-day crossing (day already has a stop) stays on the current day', () => {
   assert.equal(pivotDayIndex(1, true), 1);

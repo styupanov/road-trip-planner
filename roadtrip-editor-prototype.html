@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Road Trip Planner — интерактивный прототип</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#141518; --panel:#1b1d21; --card:#23262b; --card-hover:#282c32;
+  --line:#2e3238; --line-strong:#3a3f46;
+  --text:#e8e6e1; --text-2:#a8adb5; --text-3:#6f757e;
+  --amber:#e8b53f; --teal:#16a085; --teal-bright:#2dd4a7; --warn:#c05640;
+  --mono:'JetBrains Mono',monospace; --sans:'Inter',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;padding-bottom:76px}
+button{font-family:var(--sans);cursor:pointer;border:1px solid var(--line-strong);background:transparent;color:var(--text-2);border-radius:8px;padding:6px 14px;font-size:13px;transition:all .15s}
+button:hover{border-color:var(--text-3);color:var(--text)}
+button.primary{background:var(--amber);border-color:var(--amber);color:#1a1608;font-weight:600}
+button.primary:hover{background:#f0c25a}
+button.ghost{border:none;padding:3px 8px;font-size:14px}
+.mono{font-family:var(--mono)}
+
+header{display:flex;align-items:center;gap:20px;padding:14px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header .logo{font-family:var(--mono);font-size:13px;letter-spacing:.18em;color:var(--text-3)}
+header .route{font-size:15px;font-weight:500}
+header .meta{margin-left:auto;display:flex;align-items:center;gap:16px;font-size:12px;color:var(--text-3)}
+header .credits{font-family:var(--mono);color:var(--amber)}
+
+.map-wrap{position:relative;height:34vh;min-height:250px;border-bottom:1px solid var(--line);background:#191b1f}
+.map-wrap svg{width:100%;height:100%;display:block}
+.map-legend{position:absolute;left:20px;bottom:14px;display:flex;gap:14px;font-size:11px;color:var(--text-3);font-family:var(--mono);flex-wrap:wrap}
+.map-legend span{display:flex;align-items:center;gap:5px}
+.dot{width:9px;height:9px;border-radius:50%}
+.sq{width:9px;height:9px;border-radius:2px}
+.mapnode{cursor:pointer}
+.mapnode:hover circle,.mapnode:hover rect{stroke:#fff;stroke-width:2.5}
+
+.ribbon-wrap{padding:18px 24px 6px}
+.ribbon-ends{display:flex;justify-content:space-between;font-size:11px;color:var(--text-3);font-family:var(--mono);margin-bottom:6px}
+.ribbon{display:flex;height:52px;user-select:none}
+.day-block{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:filter .12s;overflow:hidden}
+.day-block:first-child{border-radius:10px 0 0 10px}
+.day-block:last-child{border-radius:0 10px 10px 0}
+.day-block:hover{filter:brightness(1.2)}
+.day-block.active{outline:2px solid var(--amber);outline-offset:-2px;z-index:2}
+.day-block .dnum{font-family:var(--mono);font-size:12px;font-weight:500;white-space:nowrap}
+.day-block .dtime{font-size:11px;opacity:.8;white-space:nowrap}
+.day-block.over .dtime{color:#ffcbbd;opacity:1}
+.divider{width:12px;flex:none;cursor:col-resize;display:flex;align-items:center;justify-content:center;z-index:3}
+.divider::before{content:'';width:3px;height:66%;background:var(--line-strong);border-radius:2px;transition:all .12s}
+.divider:hover::before,.divider.dragging::before{background:var(--amber);height:86%}
+.lodging-row{display:flex;margin-top:7px;height:22px}
+.lodging-pin{flex:none;width:0;display:flex;justify-content:center;position:relative}
+.lodging-pin .tag{position:absolute;top:0;white-space:nowrap;font-size:11px;color:var(--teal-bright);cursor:pointer;transform:translateX(-50%);padding:2px 6px;border-radius:5px;transition:background .12s}
+.lodging-pin .tag:hover{background:rgba(45,212,167,.12)}
+.lodging-pin .tag.empty{color:var(--text-3)}
+.lodging-pin .tag.empty:hover{background:rgba(255,255,255,.06);color:var(--text-2)}
+
+main{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:18px;padding:14px 24px 20px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:15px 18px}
+.panel h2{font-size:15px;font-weight:600;display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.panel h2 .sub{font-size:12px;font-weight:400;color:var(--text-3)}
+.panel h2 .time{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--text-2)}
+.panel h2 .time.over{color:var(--warn)}
+.hint{font-size:11px;color:var(--text-3);margin-top:8px}
+
+.sched-row{display:flex;gap:12px;padding:9px 2px;border-bottom:1px solid var(--line);align-items:flex-start}
+.sched-row:last-child{border-bottom:none}
+.sched-ico{width:26px;height:26px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:12px;margin-top:1px}
+.sched-ico.stop{background:rgba(232,181,63,.15);color:var(--amber)}
+.sched-ico.sys{color:var(--text-3);font-size:14px}
+.sched-ico.bed{background:rgba(22,160,133,.15);color:var(--teal-bright);font-size:13px}
+.sched-body{flex:1;min-width:0}
+.sched-body .name{font-size:14px}
+.sched-body .sub{font-size:12px;color:var(--text-3);margin-top:1px}
+.sched-row .act{opacity:0;transition:opacity .12s;flex:none}
+.sched-row:hover .act{opacity:1}
+
+.cand{display:flex;gap:10px;align-items:center;background:var(--card);border:1px dashed var(--line-strong);border-radius:10px;padding:9px 12px;cursor:pointer;transition:all .12s;margin-bottom:8px}
+.cand:hover{border-color:var(--amber);border-style:solid;background:var(--card-hover)}
+.cand .plus{color:var(--amber);font-size:16px;line-height:1;flex:none}
+.cand .name{font-size:13px}
+.cand .sub{font-size:11px;color:var(--text-3)}
+.cand .day-tag{margin-left:auto;font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:5px;flex:none;white-space:nowrap}
+
+.modal-bg{position:fixed;inset:0;background:rgba(10,11,13,.72);display:none;align-items:center;justify-content:center;z-index:50;padding:20px}
+.modal-bg.open{display:flex}
+.modal{background:var(--panel);border:1px solid var(--line-strong);border-radius:16px;max-width:460px;width:100%;max-height:80vh;overflow:auto;padding:18px 20px}
+.modal h3{font-size:16px;font-weight:600;margin-bottom:3px}
+.modal .msub{font-size:12px;color:var(--text-3);margin-bottom:14px}
+.hotel{display:flex;gap:11px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;cursor:pointer;transition:all .12s}
+.hotel:hover{border-color:var(--teal);background:var(--card)}
+.hotel.sel{border-color:var(--teal);background:rgba(22,160,133,.1)}
+.hotel .radio{width:15px;height:15px;border-radius:50%;border:1.5px solid var(--line-strong);flex:none}
+.hotel.sel .radio{border-color:var(--teal-bright);border-width:5px}
+.hotel .name{font-size:13px}
+.hotel .sub{font-size:11px;color:var(--text-3)}
+.modal-foot{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
+
+.footer-bar{position:fixed;left:0;right:0;bottom:0;background:rgba(20,21,24,.94);backdrop-filter:blur(10px);border-top:1px solid var(--line);display:flex;align-items:center;gap:18px;padding:11px 24px;flex-wrap:wrap;z-index:20}
+.tempo{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--text-2)}
+.tempo input[type=range]{width:120px;accent-color:var(--amber)}
+.fnote{font-size:12px;color:var(--text-3)}
+.fnote.warn{color:var(--warn)}
+.footer-bar .spacer{flex:1}
+.toast{position:fixed;bottom:88px;left:50%;transform:translateX(-50%);background:var(--card);border:1px solid var(--line-strong);border-radius:10px;padding:9px 16px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .25s;z-index:60}
+.toast.show{opacity:1}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<header>
+  <span class="logo">ROAD TRIP PLANNER</span>
+  <span class="route">Дюранго → Стимбот-Спрингс</span>
+  <div class="meta">
+    <span class="mono" id="totalMeta">—</span>
+    <span>Сохранено</span>
+    <span class="credits">2 кредита</span>
+  </div>
+</header>
+
+<div class="map-wrap">
+  <svg viewBox="0 0 1200 320" preserveAspectRatio="xMidYMid meet" id="map" role="img" aria-label="Карта маршрута"></svg>
+  <div class="map-legend">
+    <span><span class="dot" style="background:#4a90d9"></span>старт / финиш</span>
+    <span><span class="dot" style="background:var(--amber)"></span>остановка</span>
+    <span><span class="sq" style="background:var(--teal)"></span>ночёвка</span>
+    <span><span class="dot" style="border:1.5px dashed var(--text-3)"></span>кандидат</span>
+  </div>
+</div>
+
+<div class="ribbon-wrap">
+  <div class="ribbon-ends"><span id="ribStart">ДЮРАНГО</span><span id="ribEnd">СТИМБОТ-СПРИНГС</span></div>
+  <div class="ribbon" id="ribbon"></div>
+  <div class="lodging-row" id="lodgingRow"></div>
+</div>
+
+<main>
+  <section class="panel" id="dayPanel"></section>
+  <section class="panel">
+    <h2>Рядом с маршрутом <span class="sub">не включены</span></h2>
+    <div id="candList" style="margin-top:10px"></div>
+  </section>
+</main>
+
+<div class="footer-bar">
+  <div class="tempo">
+    <span>темп</span>
+    <input type="range" min="1" max="5" value="3" step="1" id="tempo" aria-label="Темп поездки">
+    <span class="mono" id="tempoLabel" style="color:var(--text-2)">—</span>
+  </div>
+  <span class="fnote">границы дней и время уточнятся при финализации</span>
+  <div class="spacer"></div>
+  <span class="fnote" id="planNote">—</span>
+  <button class="primary" onclick="toast('Прототип: здесь списывается кредит и запускается финализация')">Финализировать · 1 кредит</button>
+</div>
+
+<div class="modal-bg" id="modalBg"><div class="modal" id="modal"></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const LIMIT = 4*60;
+const DAY_COLORS = ['#1D9E75','#8b82e8','#D85A30','#7fb03a','#3aa9b0','#c98ad8'];
+
+const stops = [
+  {id:'s1',name:'Treasure Falls',cat:'водопад',rating:4.7,detour:2,visit:60,x:215,y:262,inc:true},
+  {id:'s2',name:'Chimney Rock Monument',cat:'история',rating:4.6,detour:9,visit:60,x:278,y:238,inc:true},
+  {id:'s3',name:'Joyful Journey Hot Springs',cat:'источники',rating:3.9,detour:5,visit:60,x:450,y:184,inc:true},
+  {id:'s4',name:'Monarch Mountain',cat:'горы',rating:4.5,detour:6,visit:60,x:520,y:170,inc:true},
+  {id:'s5',name:'Skyline Drive',cat:'смотровая',rating:4.7,detour:9,visit:60,x:700,y:126,inc:true},
+  {id:'s6',name:'Rocky Mountain Wildlife Park',cat:'парк',rating:4.2,detour:22,visit:60,x:950,y:76,inc:true},
+  {id:'c1',name:'Dillon Pinnacles',cat:'скалы',rating:4.4,detour:14,visit:45,x:380,y:240,inc:false},
+  {id:'c2',name:'Curecanti Recreation Area',cat:'озёра',rating:4.5,detour:2,visit:45,x:640,y:190,inc:false},
+  {id:'c3',name:'Great Sand Dunes',cat:'нацпарк',rating:4.8,detour:110,visit:120,x:900,y:140,inc:false}
+];
+const legs = [65,48,130,52,95,140,88];
+const hotelPool = {
+  1:[['The Springs Resort','Pagosa Springs',4.7],['Healing Waters Resort','Pagosa Springs',4.3],['Wyndham Pagosa','Pagosa Springs',4.1]],
+  2:[['Silver Ridge Lodge','Salida',4.6],['Amigo Motor Lodge','Salida',4.8],['Salida Inn & Monarch Suites','Salida',4.3]],
+  3:[['Grand Timber Lodge','Breckenridge',4.6],['Beaver Run Resort','Breckenridge',4.2],['The Lodge at Breckenridge','Breckenridge',4.5]],
+  4:[['Rabbit Ears Motel','Steamboat',4.4],['Hotel Bristol','Steamboat',4.5]],
+  5:[['Best Western Deer Park','Craig',4.5]]
+};
+let breaks = [2,4,5];
+let lodging = {1:'The Springs Resort · Pagosa Springs',2:'Silver Ridge Lodge · Salida',3:null};
+let activeDay = 2, plannedDays = 4;
+
+const inc = () => stops.filter(s=>s.inc);
+function fmt(m){const h=Math.floor(m/60),mm=Math.round(m%60);return h?`${h} ч ${String(mm).padStart(2,'0')} мин`:`${mm} мин`}
+function dayOf(i){for(let d=0;d<breaks.length;d++) if(i<breaks[d]) return d; return breaks.length}
+
+function buildDays(){
+  const list=inc(), n=breaks.length+1, out=[];
+  for(let d=0;d<n;d++){
+    const from=d===0?0:breaks[d-1], to=d===n-1?list.length:breaks[d];
+    const items=list.slice(from,to);
+    let drive=0; for(let i=from;i<=to;i++) if(legs[i]!=null) drive+=legs[i];
+    items.forEach(s=>drive+=s.detour);
+    const visit=items.reduce((a,s)=>a+s.visit,0);
+    out.push({n:d+1,items,drive,visit,total:drive+visit,over:drive>LIMIT,color:DAY_COLORS[d%6],lodge:lodging[d+1]||null});
+  }
+  return out;
+}
+
+function render(){
+  const days=buildDays();
+  const totalDrive=days.reduce((a,d)=>a+d.drive,0);
+  document.getElementById('totalMeta').textContent=`${fmt(totalDrive)} · ${inc().length} остановок · ${days.length} дн.`;
+  if(activeDay>days.length) activeDay=days.length;
+
+  const rib=document.getElementById('ribbon'); rib.innerHTML='';
+  const lod=document.getElementById('lodgingRow'); lod.innerHTML='';
+  days.forEach((d,i)=>{
+    if(i>0){
+      const dv=document.createElement('div'); dv.className='divider'; dv.dataset.idx=i-1;
+      dv.title='Перетащите влево/вправо, чтобы сдвинуть границу дня'; rib.appendChild(dv);
+      const pin=document.createElement('div'); pin.className='lodging-pin';
+      const tag=document.createElement('span');
+      tag.className='tag'+(days[i-1].lodge?'':' empty');
+      tag.textContent=days[i-1].lodge?'⌂ '+days[i-1].lodge:'+ выбрать ночёвку';
+      tag.onclick=()=>openHotels(i); pin.appendChild(tag); lod.appendChild(pin);
+    }
+    const b=document.createElement('div');
+    b.className='day-block'+(d.over?' over':'')+(d.n===activeDay?' active':'');
+    b.style.flex=Math.max(d.total,60)/100; b.style.background=d.color+'38'; b.style.color=d.color;
+    b.innerHTML=`<span class="dnum">ДЕНЬ ${d.n}</span><span class="dtime">${fmt(d.drive)}${d.over?' · перегружен':' · '+d.items.length+' ост.'}</span>`;
+    b.onclick=()=>{activeDay=d.n;render()};
+    rib.appendChild(b);
+    const sp=document.createElement('div'); sp.style.flex=Math.max(d.total,60)/100; lod.appendChild(sp);
+  });
+  if(days.length) lod.insertBefore(lod.lastChild,lod.firstChild)&&0;
+
+  const d=days[activeDay-1];
+  const p=document.getElementById('dayPanel');
+  let clock=9*60, h='';
+  h+=`<h2>День ${d.n} <span class="sub">${d.n===1?'Дюранго':(days[d.n-2]&&days[d.n-2].lodge?days[d.n-2].lodge.split(' · ')[1]:'в пути')} → ${d.lodge?d.lodge.split(' · ')[1]:(d.n===days.length?'Стимбот':'в пути')}</span><span class="time${d.over?' over':''}">${fmt(d.drive)} за рулём</span></h2>`;
+  h+=`<div style="margin-top:8px">`;
+  h+=`<div class="sched-row"><div class="sched-ico sys">↑</div><div class="sched-body"><div class="name">Выезд${d.n===1?' из Дюранго':(days[d.n-2]&&days[d.n-2].lodge?' из '+days[d.n-2].lodge.split(' · ')[0]:'')}</div><div class="sub">~9:00</div></div></div>`;
+  const startIdx=d.n===1?0:breaks[d.n-2];
+  d.items.forEach((s,k)=>{
+    clock+=legs[startIdx+k]+s.detour;
+    const t=`${Math.floor(clock/60)%24}:${String(Math.round(clock%60)).padStart(2,'0')}`;
+    h+=`<div class="sched-row"><div class="sched-ico stop">${inc().indexOf(s)+1}</div><div class="sched-body"><div class="name">${s.name}</div><div class="sub">~${t} · ${s.visit} мин на месте · ★${s.rating} · крюк ${s.detour} мин</div></div><button class="ghost act" title="Убрать" onclick="toggle('${s.id}')">✕</button></div>`;
+    clock+=s.visit;
+  });
+  clock+=legs[startIdx+d.items.length]||0;
+  const arr=`${Math.floor(clock/60)%24}:${String(Math.round(clock%60)).padStart(2,'0')}`;
+  if(d.n===days.length){
+    h+=`<div class="sched-row"><div class="sched-ico sys">⚑</div><div class="sched-body"><div class="name">Прибытие в Стимбот-Спрингс</div><div class="sub">~${arr}</div></div></div>`;
+  }else{
+    h+=`<div class="sched-row"><div class="sched-ico bed">⌂</div><div class="sched-body"><div class="name">${d.lodge?d.lodge.split(' · ')[0]+', '+d.lodge.split(' · ')[1]:'Ночёвка не выбрана'}</div><div class="sub">${d.lodge?'прибытие ~'+arr:'нажмите, чтобы выбрать'}</div></div><button class="act" onclick="openHotels(${d.n})">${d.lodge?'Сменить':'Выбрать'}</button></div>`;
+  }
+  h+=`</div><div class="hint">Клик по дню в ленте — переключить. Разделители тянутся мышью.</div>`;
+  p.innerHTML=h;
+
+  const cl=document.getElementById('candList'); cl.innerHTML='';
+  stops.filter(s=>!s.inc).forEach(s=>{
+    const dd=days[Math.min(days.length-1,Math.floor(days.length*(s.x/1100)))];
+    const el=document.createElement('div'); el.className='cand';
+    el.innerHTML=`<span class="plus">+</span><div><div class="name">${s.name}</div><div class="sub">${s.cat} · крюк ${s.detour} мин · ★${s.rating}</div></div><span class="day-tag" style="background:${dd.color}30;color:${dd.color}">день ${dd.n}</span>`;
+    el.onclick=()=>toggle(s.id); cl.appendChild(el);
+  });
+  const own=document.createElement('div'); own.className='cand';
+  own.innerHTML=`<span class="plus">+</span><div><div class="name">Своя точка…</div><div class="sub">адрес или клик по карте</div></div>`;
+  own.onclick=()=>toast('Прототип: здесь открылся бы ввод адреса или режим клика по карте');
+  cl.appendChild(own);
+
+  document.getElementById('planNote').textContent=`поездка займёт ${days.length} дн. — планировали ${plannedDays}`;
+  document.getElementById('planNote').className='fnote'+(days.length>plannedDays?' warn':'');
+  document.getElementById('tempoLabel').textContent=days.length+' дн.';
+  drawMap(days);
+}
+
+function drawMap(days){
+  const list=inc();
+  const pts=[{x:120,y:290},...list.map(s=>({x:s.x,y:s.y})),{x:1090,y:52}];
+  let g='';
+  for(let i=0;i<pts.length-1;i++){
+    const d=days[Math.min(dayOf(i),days.length-1)];
+    g+=`<path d="M${pts[i].x} ${pts[i].y} L${pts[i+1].x} ${pts[i+1].y}" stroke="${d.color}" stroke-width="5" fill="none" stroke-linecap="round"/>`;
+  }
+  g+=`<circle cx="120" cy="290" r="9" fill="#4a90d9"/><circle cx="1090" cy="52" r="9" fill="#4a90d9"/>`;
+  list.forEach((s,i)=>{
+    g+=`<g class="mapnode" onclick="toggle('${s.id}')"><circle cx="${s.x}" cy="${s.y}" r="9" fill="#e8b53f" stroke="#191b1f" stroke-width="3"/><text x="${s.x}" y="${s.y+4}" font-size="10" text-anchor="middle" fill="#1a1608" font-family="JetBrains Mono">${i+1}</text></g>`;
+  });
+  days.forEach((d,i)=>{
+    if(i<days.length-1&&d.lodge){const idx=breaks[i]; const p=pts[idx];
+      g+=`<rect x="${p.x-8}" y="${p.y-8}" width="17" height="17" rx="4" fill="#16a085" stroke="#191b1f" stroke-width="2"/>`;}
+  });
+  stops.filter(s=>!s.inc).forEach(s=>{
+    g+=`<g class="mapnode" onclick="toggle('${s.id}')"><circle cx="${s.x}" cy="${s.y}" r="7" fill="none" stroke="#6f757e" stroke-width="1.6" stroke-dasharray="3 3"/></g>`;
+  });
+  document.getElementById('map').innerHTML=g;
+}
+
+function toggle(id){
+  const s=stops.find(x=>x.id===id); s.inc=!s.inc;
+  const maxB=inc().length-1;
+  breaks=breaks.map(b=>Math.min(Math.max(b,1),maxB)).filter((b,i,a)=>a.indexOf(b)===i&&b<=maxB);
+  toast(s.inc?`${s.name} добавлена — день пересчитан`:`${s.name} убрана`);
+  render();
+}
+
+function openHotels(dayNum){
+  const pool=hotelPool[dayNum]||hotelPool[1];
+  const cur=lodging[dayNum];
+  let h=`<h3>Ночёвка · день ${dayNum}</h3><div class="msub">варианты рядом с концом дня</div>`;
+  pool.forEach((p,i)=>{
+    const v=p[0]+' · '+p[1];
+    h+=`<div class="hotel${cur===v?' sel':''}" onclick="pickHotel(${dayNum},'${v.replace(/'/g,"")}')"><span class="radio"></span><div><div class="name">${p[0]}</div><div class="sub">${p[1]} · ★${p[2]}</div></div></div>`;
+  });
+  h+=`<div class="hotel" onclick="pickHotel(${dayNum},'Своя точка · по адресу')"><span class="radio"></span><div><div class="name">Указать своё место</div><div class="sub">адрес или клик по карте</div></div></div>`;
+  h+=`<div class="modal-foot"><button onclick="pickHotel(${dayNum},null)">Без ночёвки</button><button onclick="closeModal()">Готово</button></div>`;
+  document.getElementById('modal').innerHTML=h;
+  document.getElementById('modalBg').classList.add('open');
+}
+function pickHotel(d,v){lodging[d]=v;closeModal();toast(v?'Ночёвка выбрана: '+v.split(' · ')[0]:'День без ночёвки');render()}
+function closeModal(){document.getElementById('modalBg').classList.remove('open')}
+document.getElementById('modalBg').onclick=e=>{if(e.target.id==='modalBg')closeModal()};
+
+document.getElementById('tempo').oninput=e=>{
+  const v=+e.target.value, n=inc().length, want=[2,3,4,5,6][v-1];
+  const k=Math.min(want-1,n-1); const step=n/(k+1);
+  breaks=[]; for(let i=1;i<=k;i++) breaks.push(Math.max(1,Math.min(n-1,Math.round(i*step))));
+  breaks=[...new Set(breaks)];
+  const keys=Object.keys(lodging); lodging={}; 
+  for(let i=1;i<=breaks.length;i++) lodging[i]=(hotelPool[i]?hotelPool[i][0][0]+' · '+hotelPool[i][0][1]:null);
+  render();
+};
+
+let drag=null;
+document.addEventListener('mousedown',e=>{
+  const dv=e.target.closest('.divider'); if(!dv)return;
+  drag={idx:+dv.dataset.idx,x:e.clientX}; dv.classList.add('dragging'); e.preventDefault();
+});
+document.addEventListener('mousemove',e=>{
+  if(!drag)return;
+  const dx=e.clientX-drag.x, w=document.getElementById('ribbon').offsetWidth/inc().length;
+  if(Math.abs(dx)>w*0.6){
+    const dir=dx>0?1:-1, nb=[...breaks], v=nb[drag.idx]+dir;
+    const lo=drag.idx===0?1:nb[drag.idx-1]+1, hi=drag.idx===nb.length-1?inc().length-1:nb[drag.idx+1]-1;
+    if(v>=lo&&v<=hi){nb[drag.idx]=v;breaks=nb;drag.x=e.clientX;render();}
+  }
+});
+document.addEventListener('mouseup',()=>{
+  if(drag)document.querySelectorAll('.divider').forEach(d=>d.classList.remove('dragging'));
+  drag=null;
+});
+
+let tid;
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(tid);tid=setTimeout(()=>t.classList.remove('show'),2200)}
+
+render();
+</script>
+</body>
+</html>

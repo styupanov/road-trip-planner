@@ -120,10 +120,28 @@ export function nearestPointIndices(
   // route geometry is unusual enough to fool the hysteresis window too —
   // re-resolve just that one waypoint within a bounded window instead of
   // trusting an unbounded re-search (see module comment above).
+  //
+  // === Bug 2: the LAST waypoint's jump has no upper bound to check against ===
+  // Every OTHER waypoint has a next one after it, so an implausibly large
+  // jump really is a red flag — a correct match should still leave room for
+  // the rest of the trip. The last waypoint (a round trip's closing "back to
+  // origin", or a one-way trip's destination) has nothing after it: its
+  // whole point is to consume the REST of the path, however long that is.
+  // Confirmed on real production data (round trip, 135321-point polyline):
+  // the primary hysteresis search above already finds the correct final
+  // index (the path's literal last point) — a legitimate 78085-point
+  // (57.7%-of-path) jump, well past MONOTONIC_JUMP_WARN_FRACTION. Applying
+  // the same length cutoff here overwrote that CORRECT match with a
+  // fallback confined to a 5000-point window that can't reach it, collapsing
+  // the whole closing leg into a near-zero-length stub. The non-monotonic
+  // (backward/decreasing) check still applies to the last waypoint too —
+  // that's a real invariant violation regardless of position, not a length
+  // judgment call.
   for (let i = 1; i < indices.length; i++) {
     const jump = indices[i] - indices[i - 1];
+    const isLastWaypoint = i === indices.length - 1;
     const isNonMonotonic = jump < 0;
-    const isImplausibleJump = jump > path.length * MONOTONIC_JUMP_WARN_FRACTION;
+    const isImplausibleJump = !isLastWaypoint && jump > path.length * MONOTONIC_JUMP_WARN_FRACTION;
     if (isNonMonotonic || isImplausibleJump) {
       const windowEnd = Math.min(path.length, indices[i - 1] + MONOTONIC_FALLBACK_WINDOW_POINTS);
       const fallbackIdx = findLocalMinimumIndex(path, waypoints[i], indices[i - 1], windowEnd);

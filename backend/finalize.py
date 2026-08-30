@@ -325,50 +325,27 @@ def _parse_active_selection(trip: dict) -> tuple[tuple[float, float], tuple[floa
     return origin, destination, included_stops
 
 
-async def build_finalize_preview(trip: dict) -> dict:
-    """Free preview (Фаза ночёвок, подшаг 1): a Valhalla-estimated day split
-    (same engine/precision as the free draft — see PlanPanel's "(оценка)"
-    labeling) plus lodging options at each night's end point, BEFORE any
-    credit is spent. Google Directions and Gemini are never called here —
-    this is the screen that now sits in front of what used to be an
-    immediate paid confirm step.
+async def _attach_lodging_options(
+    days: list[dict],
+    included_stops: list[dict],
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+    round_trip: bool,
+    radius_m: int,
+) -> dict:
+    """Shared lodging-search half of both preview flows — attaches
+    end_point + lodging_options (accommodations.find_nearest_lodging +
+    rank_for_selection, the ONE place either preview calls into Places) to
+    an ALREADY-COMPUTED `days` list, whatever produced it: a fresh Valhalla
+    day_split in build_finalize_preview, or the exact Google-computed
+    boundaries of an existing finalized snapshot in build_relodge_preview.
+    Mutates `days` in place and returns the full preview response shape, so
+    both callers can just `return` its result directly.
 
-    Reuses services.stops.build_route_through (the same Valhalla route-
-    through the free 'plan' phase already calls on every checkbox toggle)
-    and day_split.split_into_days completely as-is — this function only
-    feeds it real per-leg times and post-processes its output (end_point,
-    lodging_options). day_split itself stays entirely unaware that lodging
-    exists; see _build_route_detail_with_lodging's docstring for why that
-    split is deliberate.
-
-    Round-trip (see _is_round_trip_from_quiz): `destination` here is the
-    loop's pivot X, not where the trip actually ends — build_route_through_
-    round_trip is used instead (same merged, pivot-as-ordinary-waypoint legs
-    day_split expects, see its own docstring), and the LAST day's end_point
-    is `origin` (the trip returns there), not the pivot.
+    `destination` here is the round-trip's pivot X, not where the trip ends
+    — the LAST day's end_point is `origin` when round_trip (the loop closes
+    there), `destination` otherwise. Same convention both callers share.
     """
-    origin, destination, included_stops = _parse_active_selection(trip)
-
-    quiz_answers = trip["quiz_answers"] or {}
-    daily_limit_s = _daily_limit_s_from_quiz(quiz_answers)
-    awake_limit_s = stops_service.awake_limit_s_for_pace(_pace_from_quiz(quiz_answers))
-    radius_m = _lodging_radius_m_from_quiz(quiz_answers)
-    round_trip = _is_round_trip_from_quiz(quiz_answers)
-
-    if round_trip:
-        leg1_stops, leg2_stops = _split_included_stops_by_leg(included_stops)
-        leg1_coords = [(s["lat"], s["lon"]) for s in leg1_stops]
-        leg2_coords = [(s["lat"], s["lon"]) for s in leg2_stops]
-        through = await stops_service.build_route_through_round_trip(origin, destination, leg1_coords, leg2_coords)
-    else:
-        stop_coords = [(s["lat"], s["lon"]) for s in included_stops]
-        through = await stops_service.build_route_through(origin, destination, stop_coords)
-
-    days = day_split.split_into_days(
-        through["legs"], stop_count=len(included_stops),
-        daily_limit_s=daily_limit_s, visit_s=3600, awake_limit_s=awake_limit_s,
-    )
-
     has_lodging = False
     last_day_num = days[-1]["day"] if days else None
     trip_end = origin if round_trip else destination
@@ -414,6 +391,97 @@ async def build_finalize_preview(trip: dict) -> dict:
         # straight to the paywall/confirm step, no empty picker shown.
         "needs_selection": len(days) > 1 and has_lodging,
     }
+
+
+async def build_finalize_preview(trip: dict) -> dict:
+    """Free preview (Фаза ночёвок, подшаг 1): a Valhalla-estimated day split
+    (same engine/precision as the free draft — see PlanPanel's "(оценка)"
+    labeling) plus lodging options at each night's end point, BEFORE any
+    credit is spent. Google Directions and Gemini are never called here —
+    this is the screen that now sits in front of what used to be an
+    immediate paid confirm step.
+
+    Reuses services.stops.build_route_through (the same Valhalla route-
+    through the free 'plan' phase already calls on every checkbox toggle)
+    and day_split.split_into_days completely as-is — this function only
+    feeds it real per-leg times and post-processes its output (end_point,
+    lodging_options, via _attach_lodging_options). day_split itself stays
+    entirely unaware that lodging exists; see _build_route_detail_with_
+    lodging's docstring for why that split is deliberate.
+
+    Round-trip (see _is_round_trip_from_quiz): `destination` here is the
+    loop's pivot X, not where the trip actually ends — build_route_through_
+    round_trip is used instead (same merged, pivot-as-ordinary-waypoint legs
+    day_split expects, see its own docstring), and the LAST day's end_point
+    is `origin` (the trip returns there), not the pivot.
+    """
+    origin, destination, included_stops = _parse_active_selection(trip)
+
+    quiz_answers = trip["quiz_answers"] or {}
+    daily_limit_s = _daily_limit_s_from_quiz(quiz_answers)
+    awake_limit_s = stops_service.awake_limit_s_for_pace(_pace_from_quiz(quiz_answers))
+    radius_m = _lodging_radius_m_from_quiz(quiz_answers)
+    round_trip = _is_round_trip_from_quiz(quiz_answers)
+
+    if round_trip:
+        leg1_stops, leg2_stops = _split_included_stops_by_leg(included_stops)
+        leg1_coords = [(s["lat"], s["lon"]) for s in leg1_stops]
+        leg2_coords = [(s["lat"], s["lon"]) for s in leg2_stops]
+        through = await stops_service.build_route_through_round_trip(origin, destination, leg1_coords, leg2_coords)
+    else:
+        stop_coords = [(s["lat"], s["lon"]) for s in included_stops]
+        through = await stops_service.build_route_through(origin, destination, stop_coords)
+
+    days = day_split.split_into_days(
+        through["legs"], stop_count=len(included_stops),
+        daily_limit_s=daily_limit_s, visit_s=3600, awake_limit_s=awake_limit_s,
+    )
+
+    return await _attach_lodging_options(days, included_stops, origin, destination, round_trip, radius_m)
+
+
+async def build_relodge_preview(snapshot: dict, quiz_answers: dict | None) -> dict:
+    """Lodging preview for an ALREADY-finalized trip (add/change nights
+    without touching the stop composition, see FinalizedView's "Добавить/
+    Изменить ночёвки"). Reuses the EXACT day boundaries and stop composition
+    already locked into the trip's current finalized snapshot — Google-exact
+    numbers from the last real finalize, not a fresh Valhalla estimate — so
+    build_route_through/day_split.split_into_days are never called here at
+    all, only the shared lodging-search half (_attach_lodging_options, the
+    SAME accommodations.find_nearest_lodging/rank_for_selection call
+    build_finalize_preview uses — one lodging-search implementation, not two).
+
+    Purely a read of trip_versions.snapshot — nothing here writes to it, so
+    immutability holds exactly as before. The actual re-lodge finalize still
+    goes through the ordinary POST /finalize -> process_finalization ->
+    _build_finalized_snapshot pipeline unchanged, which re-derives its OWN
+    day boundaries from draft_state (same as any other finalize attempt,
+    including a plain retry) and writes a brand-new trip_versions row; this
+    function's output is preview-only display data, never persisted, and the
+    snapshot it reads from is never modified or replaced by it.
+    """
+    origin = (snapshot["origin"]["lat"], snapshot["origin"]["lon"])
+    destination = (snapshot["destination"]["lat"], snapshot["destination"]["lon"])
+    round_trip = bool(snapshot.get("round_trip"))
+    included_stops = snapshot["stops"]
+    radius_m = _lodging_radius_m_from_quiz(quiz_answers)
+
+    # Fresh dicts, not the snapshot's own day dicts -- _attach_lodging_options
+    # mutates in place, and the snapshot object is otherwise meant to be
+    # read-only here.
+    days = [
+        {
+            "day": d["day"],
+            "stop_indices": d["stop_indices"],
+            "drive_s": d["drive_s"],
+            "visit_s": d["visit_s"],
+            "total_s": d["total_s"],
+            "over_limit": d["over_limit"],
+        }
+        for d in snapshot["days"]
+    ]
+
+    return await _attach_lodging_options(days, included_stops, origin, destination, round_trip, radius_m)
 
 
 async def _build_route_detail_with_lodging(
@@ -648,7 +716,7 @@ async def _build_route_detail_with_lodging_round_trip(
 
 
 def _sanitize_lodging_options_by_day(
-    raw: list[dict] | None, selected_place_id_by_day: dict[int, str]
+    raw: list[dict] | None, selected_place_id_by_day: dict[int, str | None]
 ) -> dict[int, list[dict]]:
     """Defensive parse of the frontend-forwarded lodging_options_by_day (see
     FinalizeRequest, main.py) — optional, map-display-only data the frontend
@@ -704,7 +772,11 @@ def _sanitize_lodging_options_by_day(
                     "price_level": price_level if isinstance(price_level, int) and not isinstance(price_level, bool) else None,
                     "vicinity": vicinity if isinstance(vicinity, str) else None,
                     "maps_url": maps_url if isinstance(maps_url, str) else f"https://www.google.com/maps/place/?q=place_id:{place_id}",
-                    "selected": place_id == selected_place_id,
+                    # A custom (non-Places) lodging pick has place_id=None in
+                    # selected_place_id_by_day and never appears in `options`
+                    # (it wasn't part of the preview) — explicit None-check so
+                    # that can never accidentally read as a match here.
+                    "selected": selected_place_id is not None and place_id == selected_place_id,
                 })
             result[day] = clean_options
     except Exception:
@@ -869,13 +941,22 @@ async def _build_finalized_snapshot(
             "total_s": day["total_s"],
             "over_limit": day["over_limit"],
             "lodging": {
-                "place_id": lodging["place_id"],
+                "place_id": lodging.get("place_id"),
                 "name": lodging["name"],
                 "lat": lodging["lat"],
                 "lon": lodging["lon"],
-                "maps_url": f"https://www.google.com/maps/place/?q=place_id:{lodging['place_id']}",
+                # Custom (non-Places) points have no place_id to build a
+                # Places-style URL from — fall back to a plain coordinate
+                # search link so the map popup/export link is never absent
+                # or broken.
+                "maps_url": (
+                    f"https://www.google.com/maps/place/?q=place_id:{lodging['place_id']}"
+                    if lodging.get("place_id")
+                    else f"https://www.google.com/maps/search/?api=1&query={lodging['lat']},{lodging['lon']}"
+                ),
                 "rating": lodging.get("rating"),
                 "vicinity": lodging.get("vicinity"),
+                "custom": bool(lodging.get("custom")),
             } if lodging else None,
             # ALL candidates shown to the user in the free preview picker for
             # this night, selected one included — [] when the frontend never

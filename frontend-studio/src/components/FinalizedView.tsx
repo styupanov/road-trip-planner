@@ -18,6 +18,14 @@ export interface FinalizedViewProps {
   // map data (planMarkersForMap etc.) gets built — FinalizedView itself
   // only owns which icon looks active.
   onIsolateDayChange?: (day: number | null) => void;
+  // "Добавить/Изменить ночёвки" — starts a re-lodge attempt on this same
+  // trip (App.tsx: fetches relodge-preview, opens LodgingSelectionModal).
+  // Label switches on whether this version already has any lodging.
+  onRelodge: () => void;
+  relodgeLoading: boolean;
+  // Surfaced here (not the chat panel, which is hidden in phase 'finalized')
+  // — cleared by App.tsx on the next attempt.
+  relodgeError: string | null;
 }
 
 // Imperative, not a prop, on purpose: expandedDays/activeDay are FinalizedView's
@@ -146,8 +154,10 @@ const formatFinalizedAt = (iso: string): string => {
 // finalized trip has exactly one route, not several alternatives to compare).
 export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>(({
   trip, selectedStopId, onSelectStop, onEditDraft, onDayHover, onIsolateDayChange,
+  onRelodge, relodgeLoading, relodgeError,
 }, ref) => {
   const orderById = new Map(trip.stops.map((s, i) => [s.id, i + 1]));
+  const hasLodging = trip.days.some((d) => d.lodging != null);
 
   // Multi-accordion: any number of days can be expanded at once, toggling
   // one never affects the others. Day 1 open by default, everything else
@@ -361,6 +371,21 @@ export const FinalizedView = forwardRef<FinalizedViewHandle, FinalizedViewProps>
         <p className="text-[10px] text-[#5a5f66] leading-snug mb-2 text-center">
           Финальная версия неизменна. Черновик можно продолжать редактировать отдельно.
         </p>
+
+        <button
+          onClick={onRelodge}
+          disabled={relodgeLoading}
+          className="w-full px-3 py-2.5 rounded text-[12px] font-semibold bg-[#16a085]/15 text-[#16a085] border border-[#16a085]/30 hover:bg-[#16a085]/25 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {relodgeLoading ? 'Загрузка вариантов…' : hasLodging ? 'Изменить ночёвки' : 'Добавить ночёвки'}
+        </button>
+        <p className="text-[10px] text-[#5a5f66] leading-snug mt-1.5 mb-2 text-center">
+          Создаст новую версию поездки и спишет 1 Trip Credit.
+        </p>
+        {relodgeError && (
+          <p className="text-[11px] text-[#c05640] leading-snug mb-2 text-center">{relodgeError}</p>
+        )}
+
         <button
           onClick={onEditDraft}
           className="w-full px-3 py-2.5 rounded text-[12px] font-semibold bg-[#2c3138] text-[#f2ede3] border border-[#3a4048] hover:bg-[#3a4048] transition-colors cursor-pointer"
